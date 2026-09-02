@@ -33,17 +33,32 @@ _WM_EDGE_MARGIN = 0.08   # 8% from each edge
 # Falls back through common locations; last resort uses no fontfile= (may still fail).
 def _resolve_font() -> str:
     candidates = [
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/ttf-dejavu/DejaVuSans.ttf",
+        "/app/.fonts/DejaVuSans.ttf",                   # Heroku custom font path
         "/System/Library/Fonts/Helvetica.ttc",          # macOS fallback
         "C:/Windows/Fonts/arial.ttf",                   # Windows fallback
     ]
     for p in candidates:
         if os.path.exists(p):
             return p
-    return ""   # empty → omit fontfile= and hope for the best
+    # Last resort: download DejaVuSans to /tmp and use it
+    try:
+        import urllib.request
+        font_url = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
+        font_path = "/tmp/DejaVuSans.ttf"
+        if not os.path.exists(font_path):
+            urllib.request.urlretrieve(font_url, font_path)
+        if os.path.exists(font_path):
+            print(f"[watermark] Downloaded fallback font to {font_path}")
+            return font_path
+    except Exception as e:
+        print(f"[watermark] Font download failed: {e}")
+    return ""   # empty → skip watermark entirely
 
 _WM_FONT = _resolve_font()
 
@@ -81,6 +96,12 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
 
     if duration < 15:
         print(f"[watermark] Video too short ({duration:.1f}s) — skipping overlay")
+        return input_file
+
+    # Re-resolve font each call in case it was downloaded after startup
+    font = _WM_FONT or _resolve_font()
+    if not font:
+        print(f"[watermark] No font available — skipping overlay")
         return input_file
 
     # ── 2. Font size relative to frame width (scales nicely across resolutions)
@@ -141,7 +162,7 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
     # fontfile= must be set explicitly on servers without fontconfig (Heroku, Render, etc.)
     # Escape colons in the path so FFmpeg's filter parser doesn't misread it.
     fontfile_clause = (
-        f":fontfile='{_WM_FONT.replace(':', '\\:')}'" if _WM_FONT else ""
+        f":fontfile='{font.replace(':', '\\:')}'" if font else ""
     )
 
     drawtext_layers = []
