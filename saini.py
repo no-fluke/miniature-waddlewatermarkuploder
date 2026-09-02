@@ -182,8 +182,10 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
                 "-c:v", "libx264",
                 "-crf", "18",
                 "-preset", "fast",
-                "-c:a", "copy",
-                "-progress", "pipe:1",  # stream progress to stdout
+                "-c:a", "aac",          # re-encode audio to ensure merge
+                "-b:a", "128k",
+                "-movflags", "+faststart",  # makes video playable while downloading
+                "-progress", "pipe:1",
                 output_file,
             ],
             stdout=subprocess.PIPE,
