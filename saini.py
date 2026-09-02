@@ -182,9 +182,8 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
                 "-c:v", "libx264",
                 "-crf", "18",
                 "-preset", "fast",
-                "-c:a", "aac",          # re-encode audio to ensure merge
-                "-b:a", "128k",
-                "-movflags", "+faststart",  # makes video playable while downloading
+                "-c:a", "copy",              # ✅ Copy audio – no quality loss
+                "-movflags", "+faststart",   # makes video playable while downloading
                 "-progress", "pipe:1",
                 output_file,
             ],
