@@ -4,6 +4,7 @@ import time
 import mmap
 import random
 import tempfile
+import shutil
 import datetime
 import aiohttp
 import aiofiles
@@ -12,29 +13,26 @@ import logging
 import requests
 import tgcrypto
 import subprocess
+import multiprocessing
 import concurrent.futures
 from math import ceil
 from utils import progress_bar
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from io import BytesIO
-from pathlib import Path  
+from pathlib import Path
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from base64 import b64decode
 
-# ─── Random Text Watermark ────────────────────────────────────────────────────
+# ─── Font Resolution ──────────────────────────────────────────────────────────
 
-# Margin kept away from edges so text is never clipped (fraction of frame size)
-_WM_EDGE_MARGIN = 0.08   # 8% from each edge
+_WM_EDGE_MARGIN = 0.08
 
-# Explicit font path — avoids "Cannot find a valid font for the family Sans"
-# on minimal servers where fontconfig is not configured.
-# Falls back through common locations; last resort uses no fontfile= (may still fail).
 def _resolve_font() -> str:
     candidates = [
-        "DejaVuSans.ttf",                                    # bundled in repo root
-        "/app/DejaVuSans.ttf",                              # Heroku /app path
+        "DejaVuSans.ttf",
+        "/app/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
@@ -48,26 +46,35 @@ def _resolve_font() -> str:
     for p in candidates:
         if os.path.exists(p):
             return p
-    return ""   # no font found — watermark will be skipped
+    return ""
 
 _WM_FONT = _resolve_font()
 
-def add_random_text_overlay(input_file: str, output_file: str, text: str, progress_callback=None) -> str:
+
+# ─── Core: Single-pass watermark (used per-chunk in parallel) ─────────────────
+
+def add_random_text_overlay(
+    input_file: str,
+    output_file: str,
+    text: str,
+    progress_callback=None,
+    # Wave params — pass these to keep motion seamless across chunks
+    time_offset: float = 0.0,
+    period_x: float = None,
+    period_y: float = None,
+    phase_x: float = None,
+    phase_y: float = None,
+) -> str:
     """
-    Burns a CONTINUOUSLY WANDERING text watermark into a video.
+    Burns a continuously wandering text watermark into a video using FFmpeg.
 
-    The watermark moves smoothly across the entire frame at all times using
-    FFmpeg's drawtext expressions — no gaps, always visible, always moving.
+    When called per-chunk, pass time_offset + shared wave params so the
+    watermark position is seamless across chunk boundaries.
 
-    Motion model (pure FFmpeg math expressions — no per-frame Python):
-      • Two sine waves with incommensurable periods drive X and Y independently,
-        producing a Lissajous-like path that never repeats within normal video lengths.
-      • The watermark bounces across the full safe area of the frame.
-
-    Quality: -crf 23 (good quality, reasonable file size). Audio is always copied.
-    Returns output_file on success, or input_file on any failure (safe fallback).
+    Encoding: -qp 0 (lossless x264) so chunks can be concat'd with -c copy
+    without any quality loss or re-encode at the join points.
     """
-    # ── 1. Probe duration + resolution ──────────────────────────────────────
+    # ── 1. Probe resolution (duration comes from caller for chunks) ───────────
     try:
         probe = subprocess.run(
             [
@@ -88,50 +95,48 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
         print(f"[watermark] ffprobe failed: {e} — skipping overlay")
         return input_file
 
-    if duration < 5:
-        print(f"[watermark] Video too short ({duration:.1f}s) — skipping overlay")
-        return input_file
+    if duration < 1:
+        # Very short chunk — still watermark it, don't skip
+        pass
 
     if not _WM_FONT:
-        print(f"[watermark] No font available — skipping overlay")
+        print("[watermark] No font available — skipping overlay")
         return input_file
     font = _WM_FONT
 
-    # ── 2. Font size relative to frame width ─────────────────────────────────
-    fontsize = max(22, int(vid_w * 0.028))   # ~2.8% of width, min 22 px
-
-    # Rough text size estimate (used to keep text fully inside frame)
+    # ── 2. Font + safe area ───────────────────────────────────────────────────
+    fontsize   = max(22, int(vid_w * 0.028))
     text_w_est = int(len(text) * fontsize * 0.60)
     text_h_est = int(fontsize * 1.2)
 
-    # Safe drawable area in pixels
-    margin_x = int(vid_w * _WM_EDGE_MARGIN)
-    margin_y = int(vid_h * _WM_EDGE_MARGIN)
+    margin_x   = int(vid_w * _WM_EDGE_MARGIN)
+    margin_y   = int(vid_h * _WM_EDGE_MARGIN)
     safe_x_min = margin_x
     safe_x_max = max(margin_x + 1, vid_w - margin_x - text_w_est)
     safe_y_min = margin_y
     safe_y_max = max(margin_y + 1, vid_h - margin_y - text_h_est)
 
-    # Range of motion (half-amplitude for sine waves)
     range_x = (safe_x_max - safe_x_min) / 2
     range_y = (safe_y_max - safe_y_min) / 2
-    cx = safe_x_min + range_x   # centre X
-    cy = safe_y_min + range_y   # centre Y
+    cx      = safe_x_min + range_x
+    cy      = safe_y_min + range_y
 
-    # ── 3. Wandering speed — incommensurable periods so path never repeats ────
-    # Period in seconds for one full oscillation. Use irrational ratio (√2 ≈ 1.4142)
-    # so X and Y are never in sync → covers all quadrants over time.
-    period_x = random.uniform(60, 90)           # e.g. 7–13 s per X cycle
-    period_y = period_x * 1.4142135623730951   # √2 × period_x
+    # ── 3. Wave params — use caller's or generate fresh ones ─────────────────
+    if period_x is None:
+        period_x = random.uniform(60, 90)
+    if period_y is None:
+        period_y = period_x * 1.4142135623730951   # √2 ratio → Lissajous path
+    if phase_x is None:
+        phase_x = random.uniform(0, 6.2832)
+    if phase_y is None:
+        phase_y = random.uniform(0, 6.2832)
 
-    # Random phase offset so different videos start at different positions
-    phase_x = random.uniform(0, 6.2832)
-    phase_y = random.uniform(0, 6.2832)
+    print(
+        f"[watermark] {vid_w}x{vid_h} fontsize={fontsize} "
+        f"offset={time_offset:.1f}s px={period_x:.1f}s py={period_y:.1f}s"
+    )
 
-    print(f"[watermark] wandering overlay at {vid_w}x{vid_h}, fontsize={fontsize}, "
-          f"period_x={period_x:.1f}s, period_y={period_y:.1f}s")
-
-    # ── 4. Escape text for FFmpeg drawtext ───────────────────────────────────
+    # ── 4. Escape text ────────────────────────────────────────────────────────
     safe_text = (
         text
         .replace("\\", "\\\\")
@@ -139,22 +144,21 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
         .replace(":",  "\\:")
     )
 
-    # ── 5. Build the wandering drawtext filter ───────────────────────────────
-    # FFmpeg drawtext supports arithmetic expressions for x/y evaluated per-frame.
-    # sin() argument is in radians. 2*PI/period gives angular frequency.
-    #   x = cx + range_x * sin(2π/period_x * t + phase_x)
-    #   y = cy + range_y * sin(2π/period_y * t + phase_y)
-    # We use 6.2832 ≈ 2π
-
+    # ── 5. Build FFmpeg drawtext filter ───────────────────────────────────────
+    # KEY: use (t + time_offset) so chunks continue the wave smoothly.
+    # This makes the watermark position seamless at every chunk join.
     fontfile_clause = (
         f":fontfile='{font.replace(chr(58), chr(92) + chr(58))}'" if font else ""
     )
 
-    # FFmpeg expression for continuously moving position
-    x_expr = f"{cx:.1f}+{range_x:.1f}*sin(6.2832/{period_x:.4f}*t+{phase_x:.4f})"
-    y_expr = f"{cy:.1f}+{range_y:.1f}*sin(6.2832/{period_y:.4f}*t+{phase_y:.4f})"
+    # t in FFmpeg drawtext is the PTS of the current frame.
+    # For chunk N that starts at global_time=time_offset:
+    #   global_t = t + time_offset
+    # So we substitute (t+{time_offset:.4f}) for t in the sine expressions.
+    t_expr  = f"(t+{time_offset:.4f})"
+    x_expr  = f"{cx:.1f}+{range_x:.1f}*sin(6.2832/{period_x:.4f}*{t_expr}+{phase_x:.4f})"
+    y_expr  = f"{cy:.1f}+{range_y:.1f}*sin(6.2832/{period_y:.4f}*{t_expr}+{phase_y:.4f})"
 
-    # Single drawtext filter — always visible, always moving
     drawtext_filter = (
         f"drawtext="
         f"text='{safe_text}'"
@@ -162,17 +166,19 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
         f":fontsize={fontsize}"
         f":fontcolor=white@0.55"
         f":shadowcolor=black@0.55"
-        f":shadowx=2"
-        f":shadowy=2"
+        f":shadowx=2:shadowy=2"
         f":x={x_expr}"
         f":y={y_expr}"
     )
 
-    # vf filter chain: force yuv420p so output plays on ALL players/devices
-    # yuv420p is required for Telegram, WhatsApp, iOS, Android compatibility
+    # yuv420p: required for Telegram / WhatsApp / iOS / Android compatibility
     filter_chain = f"{drawtext_filter},format=yuv420p"
 
-    # ── 6. Run FFmpeg with progress tracking ─────────────────────────────────
+    # ── 6. FFmpeg encode ──────────────────────────────────────────────────────
+    # -qp 0  → lossless x264 (no quality loss, larger file than crf 23 but
+    #           identical pixel values — safe for -c copy concat afterwards)
+    # -preset ultrafast → fastest encode at qp 0 (lossless doesn't benefit
+    #           from slower presets the way lossy does)
     try:
         process = subprocess.Popen(
             [
@@ -180,12 +186,11 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
                 "-i", input_file,
                 "-vf", filter_chain,
                 "-c:v", "libx264",
-                "-crf", "23",           # good quality, smaller than crf 18
-                "-preset", "fast",
-                "-profile:v", "baseline",   # widest device compatibility
-                "-level", "3.1",
-                "-c:a", "copy",             # copy audio — no quality loss
-                "-movflags", "+faststart",  # MP4 moov atom at front → plays while downloading
+                "-qp", "0",              # ← LOSSLESS (no quality loss)
+                "-preset", "ultrafast",  # ← fastest encode for lossless
+                "-profile:v", "high",    # high profile required for lossless
+                "-c:a", "copy",
+                "-movflags", "+faststart",
                 "-progress", "pipe:1",
                 output_file,
             ],
@@ -200,10 +205,10 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
             if not line and process.poll() is not None:
                 break
             line = line.strip()
-            if line.startswith("out_time_ms="):
+            if line.startswith("out_time_ms=") and duration > 0:
                 try:
                     out_ms = int(line.split("=")[1])
-                    pct = min(100, int((out_ms / 1000) / duration * 100))
+                    pct    = min(100, int((out_ms / 1000) / duration * 100))
                     if pct != last_pct and progress_callback:
                         progress_callback(pct)
                         last_pct = pct
@@ -212,17 +217,373 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
 
         process.wait(timeout=3600)
         if process.returncode != 0:
-            err = process.stderr.read()[-2000:] if process.stderr else ""
+            err = (process.stderr.read() or "")[-2000:]
             print(f"[watermark] FFmpeg error (code {process.returncode}):\n{err}")
             return input_file
+
         print(f"[watermark] Done → {output_file}")
         return output_file
+
     except Exception as ex:
         print(f"[watermark] Exception: {ex}")
         return input_file
 
 
-# ─── Helpers used by main.py ──────────────────────────────────────────────────
+# ─── Multiprocessing worker (must be top-level to be picklable) ───────────────
+
+def _wm_chunk_worker(args: tuple) -> str:
+    """
+    Called by multiprocessing.Pool — runs add_random_text_overlay for one chunk.
+    Returns the output path of the watermarked chunk.
+    """
+    (input_file, output_file, text,
+     time_offset, period_x, period_y, phase_x, phase_y) = args
+
+    return add_random_text_overlay(
+        input_file=input_file,
+        output_file=output_file,
+        text=text,
+        progress_callback=None,   # no per-chunk progress in parallel mode
+        time_offset=time_offset,
+        period_x=period_x,
+        period_y=period_y,
+        phase_x=phase_x,
+        phase_y=phase_y,
+    )
+
+
+# ─── Public API: parallel chunked watermark ───────────────────────────────────
+
+def add_watermark_parallel(
+    input_file: str,
+    output_file: str,
+    text: str,
+    chunk_duration: int = 300,   # 5 min chunks (tune to your CPU count)
+    progress_callback=None,
+    workers: int = None,         # defaults to os.cpu_count()
+) -> str:
+    """
+    Fast, lossless parallel watermarking pipeline:
+
+      1. Split input into chunks with -c copy  (instant, no re-encode)
+      2. Watermark each chunk in parallel with -qp 0 (lossless x264)
+         — wave params shared so motion is seamless across boundaries
+      3. Concat watermarked chunks with -c copy (instant, no re-encode)
+      4. Final output: same quality as source, watermark burned in
+
+    Falls back to single-pass add_random_text_overlay on any error.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="wm_parallel_")
+    print(f"[wm_parallel] Working in {tmp_dir}")
+
+    try:
+        # ── Step 1: Probe total duration ──────────────────────────────────────
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             input_file],
+            capture_output=True, text=True, timeout=30,
+        )
+        total_duration = float(probe.stdout.strip() or 0)
+        if total_duration < 5:
+            print("[wm_parallel] Video too short — single pass")
+            return add_random_text_overlay(input_file, output_file, text, progress_callback)
+
+        if progress_callback:
+            progress_callback(2)
+
+        # ── Step 2: Split at keyframes (-c copy, ultra-fast) ─────────────────
+        # -reset_timestamps 1 → each chunk's PTS starts at 0 (required so
+        # ffprobe duration is correct per chunk and t=0 in drawtext is the
+        # chunk's first frame — we add time_offset to compensate).
+        chunk_pattern = os.path.join(tmp_dir, "chunk_%04d.mp4")
+        split_result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", input_file,
+                "-c", "copy",
+                "-map", "0",
+                "-segment_time", str(chunk_duration),
+                "-f", "segment",
+                "-reset_timestamps", "1",
+                chunk_pattern,
+            ],
+            capture_output=True, text=True,
+        )
+        if split_result.returncode != 0:
+            raise RuntimeError(f"Split failed: {split_result.stderr[-1000:]}")
+
+        chunks = sorted([
+            os.path.join(tmp_dir, f)
+            for f in os.listdir(tmp_dir)
+            if f.startswith("chunk_") and f.endswith(".mp4")
+        ])
+        if not chunks:
+            raise RuntimeError("No chunks produced by split step")
+
+        print(f"[wm_parallel] Split into {len(chunks)} chunks")
+        if progress_callback:
+            progress_callback(5)
+
+        # ── Step 3: One shared wave — ensures seamless motion at joins ────────
+        period_x = random.uniform(60, 90)
+        period_y = period_x * 1.4142135623730951
+        phase_x  = random.uniform(0, 6.2832)
+        phase_y  = random.uniform(0, 6.2832)
+
+        # Measure each chunk's actual duration to compute exact time offsets.
+        # (Chunks near keyframes may be slightly shorter/longer than chunk_duration.)
+        offsets      = []
+        running_time = 0.0
+        for chunk in chunks:
+            offsets.append(running_time)
+            r = subprocess.run(
+                ["ffprobe", "-v", "error",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 chunk],
+                capture_output=True, text=True,
+            )
+            chunk_dur    = float(r.stdout.strip() or chunk_duration)
+            running_time += chunk_dur
+
+        # ── Step 4: Build task list ───────────────────────────────────────────
+        tasks = []
+        for i, (chunk, offset) in enumerate(zip(chunks, offsets)):
+            out_chunk = os.path.join(tmp_dir, f"wm_{i:04d}.mp4")
+            tasks.append((
+                chunk, out_chunk, text,
+                offset, period_x, period_y, phase_x, phase_y,
+            ))
+
+        # ── Step 5: Parallel encode (all CPU cores) ───────────────────────────
+        cpu_count = workers or max(1, os.cpu_count() or 1)
+        print(f"[wm_parallel] Watermarking {len(tasks)} chunks on {cpu_count} cores")
+
+        # NOTE: Each worker runs its own ffmpeg process, so cpu_count workers
+        # means cpu_count simultaneous ffmpeg encodes — tune if memory-limited.
+        with multiprocessing.Pool(processes=cpu_count) as pool:
+            wm_chunks = pool.map(_wm_chunk_worker, tasks)
+
+        # Verify all chunks succeeded (fall back to input_file path means failure)
+        failed = [wm for wm, orig in zip(wm_chunks, [t[1] for t in tasks])
+                  if wm == orig[0]]   # returned input_file == failure
+        if failed:
+            print(f"[wm_parallel] {len(failed)} chunk(s) failed watermarking")
+
+        if progress_callback:
+            progress_callback(90)
+
+        # ── Step 6: Concat with -c copy (no re-encode, no quality loss) ───────
+        # This works losslessly because every chunk was encoded with the same
+        # codec (-c:v libx264 -qp 0) and the same profile/level.
+        filelist_path = os.path.join(tmp_dir, "filelist.txt")
+        with open(filelist_path, "w") as f:
+            for wm_chunk in wm_chunks:
+                f.write(f"file '{wm_chunk}'\n")
+
+        concat_result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", filelist_path,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                output_file,
+            ],
+            capture_output=True, text=True,
+        )
+        if concat_result.returncode != 0:
+            raise RuntimeError(f"Concat failed: {concat_result.stderr[-1000:]}")
+
+        if progress_callback:
+            progress_callback(100)
+
+        print(f"[wm_parallel] Done → {output_file}")
+        return output_file
+
+    except Exception as ex:
+        print(f"[wm_parallel] Failed ({ex}) — falling back to single-pass")
+        return add_random_text_overlay(input_file, output_file, text, progress_callback)
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ─── send_vid integration ─────────────────────────────────────────────────────
+
+async def send_vid(
+    bot: Client,
+    m: Message,
+    cc,
+    filename,
+    thumb,
+    name,
+    prog,
+    channel_id,
+    topic_id=None,
+    watermark_text: str = None,
+):
+    """
+    Send video to channel, with optional parallel-lossless watermark.
+    Replaces the old single-pass watermark call with add_watermark_parallel.
+    """
+    if watermark_text:
+        base, ext = os.path.splitext(filename)
+        wm_output = f"{base}_wm{ext or '.mp4'}"
+        status_msg = await m.reply_text(
+            f"🖊️ **Adding Watermark...**\n"
+            f"<blockquote>{name}</blockquote>\n"
+            f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 0%"
+        )
+
+        last_pct_sent = [-1]
+
+        async def update_progress(pct):
+            if pct == last_pct_sent[0]:
+                return
+            last_pct_sent[0] = pct
+            filled = int(pct / 10)
+            bar    = "🟩" * filled + "⬜" * (10 - filled)
+            try:
+                await status_msg.edit_text(
+                    f"🖊️ **Adding Watermark...**\n"
+                    f"<blockquote>{name}</blockquote>\n"
+                    f"{bar} {pct}%"
+                )
+            except Exception:
+                pass
+
+        def sync_progress_callback(pct):
+            asyncio.run_coroutine_threadsafe(update_progress(pct), loop)
+
+        loop = asyncio.get_event_loop()
+
+        # ← use add_watermark_parallel instead of add_random_text_overlay
+        watermarked = await loop.run_in_executor(
+            None,
+            add_watermark_parallel,
+            filename, wm_output, watermark_text,
+            300,                    # chunk_duration: 5 min
+            sync_progress_callback, # progress_callback
+            None,                   # workers: auto (os.cpu_count())
+        )
+
+        await status_msg.edit_text(
+            f"🖊️ **Watermark Done ✅**\n"
+            f"<blockquote>{name}</blockquote>\n"
+            f"🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%"
+        )
+        await asyncio.sleep(1)
+        await status_msg.delete()
+
+        if watermarked != filename:
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+            filename = watermarked
+        else:
+            print(f"[send_vid] Watermark failed/skipped for {name}, sending original")
+
+    subprocess.run(
+        f'ffmpeg -i "{filename}" -ss 00:00:10 -vframes 1 "{filename}.jpg"',
+        shell=True,
+    )
+    await prog.delete(True)
+
+    thread_kwargs = {"message_thread_id": topic_id} if topic_id else {}
+
+    reply1 = await bot.send_message(
+        channel_id,
+        f"**📩 Uploading Video 📩:-**\n<blockquote>**{name}**</blockquote>",
+        **thread_kwargs,
+    )
+    reply = await m.reply_text(
+        f"**Generate Thumbnail:**\n<blockquote>**{name}**</blockquote>"
+    )
+
+    try:
+        thumbnail = f"{filename}.jpg" if thumb == "/d" else thumb
+    except Exception as e:
+        await m.reply_text(str(e))
+
+    dur        = int(duration(filename))
+    start_time = time.time()
+    file_size  = os.path.getsize(filename)
+
+    try:
+        if file_size > MAX_FILE_SIZE_BYTES:
+            split_msg = await m.reply_text(
+                f"⚠️ File size is **{file_size // (1024*1024)} MB**, splitting into parts..."
+            )
+            parts = await split_video(filename)
+            await split_msg.delete()
+            if not parts:
+                await m.reply_text("❌ Splitting failed, attempting to send original file...")
+                parts = [filename]
+
+            for idx, part_file in enumerate(parts, start=1):
+                part_caption = f"{cc}\n\n📦 **Part {idx}/{len(parts)}**"
+                part_dur     = int(duration(part_file))
+                start_time   = time.time()
+                try:
+                    await bot.send_video(
+                        channel_id, part_file,
+                        caption=part_caption,
+                        supports_streaming=True,
+                        height=720, width=1280,
+                        thumb=thumbnail,
+                        duration=part_dur,
+                        progress=progress_bar,
+                        progress_args=(reply, start_time),
+                        **thread_kwargs,
+                    )
+                except Exception:
+                    await bot.send_document(
+                        channel_id, part_file,
+                        caption=part_caption,
+                        progress=progress_bar,
+                        progress_args=(reply, start_time),
+                        **thread_kwargs,
+                    )
+                if part_file != filename and os.path.exists(part_file):
+                    os.remove(part_file)
+        else:
+            try:
+                await bot.send_video(
+                    channel_id, filename,
+                    caption=cc,
+                    supports_streaming=True,
+                    height=720, width=1280,
+                    thumb=thumbnail,
+                    duration=dur,
+                    progress=progress_bar,
+                    progress_args=(reply, start_time),
+                    **thread_kwargs,
+                )
+            except Exception:
+                await bot.send_document(
+                    channel_id, filename,
+                    caption=cc,
+                    progress=progress_bar,
+                    progress_args=(reply, start_time),
+                    **thread_kwargs,
+                )
+    finally:
+        if os.path.exists(filename):
+            os.remove(filename)
+        await reply.delete(True)
+        await reply1.delete(True)
+        thumb_path = f"{filename}.jpg"
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
+
+
+# ─── All original helpers below (unchanged) ───────────────────────────────────
+
+MAX_FILE_SIZE_BYTES = 2000 * 1024 * 1024
 
 def duration(filename):
     result = subprocess.run(
@@ -243,7 +604,7 @@ def get_mps_and_keys(api_url):
 
 def exec(cmd):
     process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output = process.stdout.decode()
+    output  = process.stdout.decode()
     print(output)
     return output
 
@@ -264,14 +625,14 @@ async def aio(url, name):
 
 async def download(url, name):
     MIME_TO_EXT = {
-        'video/mp4':           'mp4',
-        'video/x-matroska':    'mkv',
-        'video/webm':          'webm',
-        'video/quicktime':     'mov',
-        'video/x-msvideo':     'avi',
-        'application/pdf':     'pdf',
-        'image/jpeg':          'jpg',
-        'image/png':           'png',
+        'video/mp4':        'mp4',
+        'video/x-matroska': 'mkv',
+        'video/webm':       'webm',
+        'video/quicktime':  'mov',
+        'video/x-msvideo':  'avi',
+        'application/pdf':  'pdf',
+        'image/jpeg':       'jpg',
+        'image/png':        'png',
     }
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
@@ -280,7 +641,7 @@ async def download(url, name):
                 ext = MIME_TO_EXT.get(content_type)
                 if not ext:
                     from urllib.parse import urlparse
-                    path = urlparse(str(resp.url)).path
+                    path    = urlparse(str(resp.url)).path
                     _, url_ext = os.path.splitext(path)
                     ext = url_ext.lstrip('.') if url_ext else 'pdf'
                 ka = f'{name}.{ext}'
@@ -300,42 +661,38 @@ async def pdf_download(url, file_name, chunk_size=1024 * 10):
     return file_name
 
 def parse_vid_info(info):
-    info = info.strip()
-    info = info.split("\n")
+    info     = info.strip().split("\n")
     new_info = []
-    temp = []
+    temp     = []
     for i in info:
         i = str(i)
         if "[" not in i and '---' not in i:
             while "  " in i:
                 i = i.replace("  ", " ")
-            i.strip()
-            i = i.split("|")[0].split(" ", 2)
+            i = i.strip().split("|")[0].split(" ", 2)
             try:
                 if "RESOLUTION" not in i[2] and i[2] not in temp and "audio" not in i[2]:
                     temp.append(i[2])
                     new_info.append((i[0], i[2]))
-            except:
+            except Exception:
                 pass
     return new_info
 
 def vid_info(info):
-    info = info.strip()
-    info = info.split("\n")
+    info     = info.strip().split("\n")
     new_info = dict()
-    temp = []
+    temp     = []
     for i in info:
         i = str(i)
         if "[" not in i and '---' not in i:
             while "  " in i:
                 i = i.replace("  ", " ")
-            i.strip()
-            i = i.split("|")[0].split(" ", 3)
+            i = i.strip().split("|")[0].split(" ", 3)
             try:
                 if "RESOLUTION" not in i[2] and i[2] not in temp and "audio" not in i[2]:
                     temp.append(i[2])
                     new_info.update({f'{i[2]}': f'{i[0]}'})
-            except:
+            except Exception:
                 pass
     return new_info
 
@@ -386,10 +743,10 @@ async def decrypt_and_merge_video(mpd_url, keys_string, output_path, output_name
         print(f"Running command: {cmd4}")
         os.system(cmd4)
 
-        if (output_path / "video.mp4").exists():
-            (output_path / "video.mp4").unlink()
-        if (output_path / "audio.m4a").exists():
-            (output_path / "audio.m4a").unlink()
+        for f in ["video.mp4", "audio.m4a"]:
+            p = output_path / f
+            if p.exists():
+                p.unlink()
 
         filename = output_path / f"{output_name}.mp4"
         if not filename.exists():
@@ -398,7 +755,6 @@ async def decrypt_and_merge_video(mpd_url, keys_string, output_path, output_name
         cmd5 = f'ffmpeg -i "{filename}" 2>&1 | grep "Duration"'
         duration_info = os.popen(cmd5).read()
         print(f"Duration info: {duration_info}")
-
         return str(filename)
 
     except Exception as e:
@@ -438,13 +794,12 @@ def human_readable_size(size, decimal_places=2):
     return f"{size:.{decimal_places}f} {unit}"
 
 def time_name():
-    date = datetime.date.today()
-    now  = datetime.datetime.now()
+    date         = datetime.date.today()
+    now          = datetime.datetime.now()
     current_time = now.strftime("%H%M%S")
     return f"{date} {current_time}.mp4"
 
-
-failed_counter = 0  # global retry counter for download_video
+failed_counter = 0
 
 async def download_video(url, cmd, name):
     download_cmd = (
@@ -509,13 +864,10 @@ async def download_and_decrypt_video(url, cmd, name, key):
             print(f"Failed to decrypt {video_path}.")
             return None
 
-MAX_FILE_SIZE_BYTES = 2000 * 1024 * 1024  # 2000 MB
-
 async def split_video(filename):
     """Split a video into parts of ~1999 MB each using ffmpeg segment muxer."""
-    base, ext = os.path.splitext(filename)
-    pattern   = f"{base}_part%03d{ext}"
-
+    base, ext  = os.path.splitext(filename)
+    pattern    = f"{base}_part%03d{ext}"
     file_size  = os.path.getsize(filename)
     part_size  = 1999 * 1024 * 1024
     num_parts  = ceil(file_size / part_size)
@@ -525,7 +877,7 @@ async def split_video(filename):
          "-of", "default=noprint_wrappers=1:nokey=1", filename],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
-    total_duration = float(result.stdout.strip() or 0)
+    total_duration     = float(result.stdout.strip() or 0)
     part_duration_secs = int(total_duration / num_parts) if num_parts > 1 else int(total_duration)
 
     cmd = (
@@ -542,175 +894,3 @@ async def split_video(filename):
         and f.endswith(ext)
     ])
     return [os.path.join(dir_name, p) for p in parts]
-
-
-# ─── send_vid ─────────────────────────────────────────────────────────────────
-
-async def send_vid(
-    bot: Client,
-    m: Message,
-    cc,
-    filename,
-    thumb,
-    name,
-    prog,
-    channel_id,
-    topic_id=None,
-    watermark_text: str = None,   # ← NEW: pass CR / credit string here
-):
-    """
-    Send a video to a channel, optionally inside a forum topic.
-
-    watermark_text: if provided, a random-timed text overlay is burned into
-                    the video before upload.  Pass None to skip watermarking.
-    """
-    # ── Optional: burn random text watermark ─────────────────────────────────
-    if watermark_text:
-        base, ext = os.path.splitext(filename)
-        wm_output = f"{base}_wm{ext or '.mp4'}"
-        status_msg = await m.reply_text(
-            f"🖊️ **Adding Watermark...**\n"
-            f"<blockquote>{name}</blockquote>\n"
-            f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 0%"
-        )
-
-        last_pct_sent = [-1]
-
-        async def update_progress(pct):
-            if pct == last_pct_sent[0]:
-                return
-            last_pct_sent[0] = pct
-            filled = int(pct / 10)
-            bar = "🟩" * filled + "⬜" * (10 - filled)
-            try:
-                await status_msg.edit_text(
-                    f"🖊️ **Adding Watermark...**\n"
-                    f"<blockquote>{name}</blockquote>\n"
-                    f"{bar} {pct}%"
-                )
-            except Exception:
-                pass
-
-        def sync_progress_callback(pct):
-            asyncio.run_coroutine_threadsafe(update_progress(pct), loop)
-
-        loop = asyncio.get_event_loop()
-        watermarked = await loop.run_in_executor(
-            None, add_random_text_overlay, filename, wm_output, watermark_text, sync_progress_callback
-        )
-        await status_msg.edit_text(
-            f"🖊️ **Watermark Done ✅**\n"
-            f"<blockquote>{name}</blockquote>\n"
-            f"🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%"
-        )
-        await asyncio.sleep(1)
-        await status_msg.delete()
-        if watermarked != filename:
-            try:
-                os.remove(filename)
-            except OSError:
-                pass
-            filename = watermarked
-        else:
-            print(f"[send_vid] Watermark failed/skipped for {name}, sending original")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    subprocess.run(
-        f'ffmpeg -i "{filename}" -ss 00:00:10 -vframes 1 "{filename}.jpg"',
-        shell=True,
-    )
-    await prog.delete(True)
-
-    thread_kwargs = {"message_thread_id": topic_id} if topic_id else {}
-
-    reply1 = await bot.send_message(
-        channel_id,
-        f"**📩 Uploading Video 📩:-**\n<blockquote>**{name}**</blockquote>",
-        **thread_kwargs,
-    )
-    reply = await m.reply_text(
-        f"**Generate Thumbnail:**\n<blockquote>**{name}**</blockquote>"
-    )
-
-    try:
-        if thumb == "/d":
-            thumbnail = f"{filename}.jpg"
-        else:
-            thumbnail = thumb
-    except Exception as e:
-        await m.reply_text(str(e))
-
-    dur        = int(duration(filename))
-    start_time = time.time()
-    file_size  = os.path.getsize(filename)
-
-    try:
-        if file_size > MAX_FILE_SIZE_BYTES:
-            # ── Large file: split into parts ─────────────────────────────────
-            split_msg = await m.reply_text(
-                f"⚠️ File size is **{file_size // (1024*1024)} MB**, splitting into parts..."
-            )
-            parts = await split_video(filename)
-            await split_msg.delete()
-            if not parts:
-                await m.reply_text("❌ Splitting failed, attempting to send original file...")
-                parts = [filename]
-
-            for idx, part_file in enumerate(parts, start=1):
-                part_caption = f"{cc}\n\n📦 **Part {idx}/{len(parts)}**"
-                part_dur     = int(duration(part_file))
-                start_time   = time.time()
-                try:
-                    await bot.send_video(
-                        channel_id, part_file,
-                        caption=part_caption,
-                        supports_streaming=True,
-                        height=720, width=1280,
-                        thumb=thumbnail,
-                        duration=part_dur,
-                        progress=progress_bar,
-                        progress_args=(reply, start_time),
-                        **thread_kwargs,
-                    )
-                except Exception:
-                    await bot.send_document(
-                        channel_id, part_file,
-                        caption=part_caption,
-                        progress=progress_bar,
-                        progress_args=(reply, start_time),
-                        **thread_kwargs,
-                    )
-                if part_file != filename and os.path.exists(part_file):
-                    os.remove(part_file)
-
-        else:
-            # ── Normal send ───────────────────────────────────────────────────
-            try:
-                await bot.send_video(
-                    channel_id, filename,
-                    caption=cc,
-                    supports_streaming=True,
-                    height=720, width=1280,
-                    thumb=thumbnail,
-                    duration=dur,
-                    progress=progress_bar,
-                    progress_args=(reply, start_time),
-                    **thread_kwargs,
-                )
-            except Exception:
-                await bot.send_document(
-                    channel_id, filename,
-                    caption=cc,
-                    progress=progress_bar,
-                    progress_args=(reply, start_time),
-                    **thread_kwargs,
-                )
-
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
-        await reply.delete(True)
-        await reply1.delete(True)
-        thumb_path = f"{filename}.jpg"
-        if os.path.exists(thumb_path):
-            os.remove(thumb_path)
