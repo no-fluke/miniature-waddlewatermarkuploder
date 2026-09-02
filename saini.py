@@ -39,26 +39,40 @@ def _resolve_font() -> str:
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/ttf-dejavu/DejaVuSans.ttf",
-        "/app/.fonts/DejaVuSans.ttf",                   # Heroku custom font path
-        "/System/Library/Fonts/Helvetica.ttc",          # macOS fallback
-        "C:/Windows/Fonts/arial.ttf",                   # Windows fallback
+        "/app/.fonts/DejaVuSans.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "C:/Windows/Fonts/arial.ttf",
     ]
     for p in candidates:
         if os.path.exists(p):
             return p
-    # Last resort: download DejaVuSans to /tmp and use it
+    # Try fc-list to find any installed .ttf font
     try:
-        import urllib.request
-        font_url = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
-        font_path = "/tmp/DejaVuSans.ttf"
-        if not os.path.exists(font_path):
-            urllib.request.urlretrieve(font_url, font_path)
-        if os.path.exists(font_path):
-            print(f"[watermark] Downloaded fallback font to {font_path}")
-            return font_path
-    except Exception as e:
-        print(f"[watermark] Font download failed: {e}")
-    return ""   # empty → skip watermark entirely
+        result = subprocess.run(
+            ["fc-list", "--format=%{file}\n"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if line.endswith(".ttf") and os.path.exists(line):
+                print(f"[watermark] Found system font via fc-list: {line}")
+                return line
+    except Exception:
+        pass
+    # Try finding any .ttf under /usr/share/fonts
+    try:
+        result = subprocess.run(
+            ["find", "/usr/share/fonts", "-name", "*.ttf", "-type", "f"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().splitlines():
+            line = line.strip()
+            if os.path.exists(line):
+                print(f"[watermark] Found font via find: {line}")
+                return line
+    except Exception:
+        pass
+    return ""   # no font found — watermark will be skipped
 
 _WM_FONT = _resolve_font()
 
