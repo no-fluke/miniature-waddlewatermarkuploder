@@ -1,0 +1,68 @@
+{
+    "name": "𝐒𝐚𝐢𝐧𝐢 𝐓𝐱𝐭 𝐋𝐞𝐞𝐜𝐡 𝐁𝐨𝐭",
+    "description": "𝑻𝒆𝒙𝒕 𝑳𝒆𝒆𝒄𝒉 𝑽𝒊𝒅𝒆𝒐 𝑬𝒙𝒕𝒓𝒂𝒄𝒕𝒐𝒓 𝑭𝒐𝒓 𝑻𝒆𝒍𝒆𝒈𝒓𝒂𝒎",
+    "logo": "",
+    "keywords": [
+        "text-video",
+        "video-extract",
+        "pyrogram"
+    ],
+    "repository": "",
+    "success_url": "",
+    "stack": "container",
+    "env": {
+        "API_ID": {
+            "description": "𝑬𝒏𝒕𝒆𝒓 𝒀𝒐𝒖𝒓 𝑨𝒑𝒊 𝑰𝑫",
+            "value": "22182189",
+            "required": true
+        },
+        "API_HASH": {
+            "description": "𝑬𝒏𝒕𝒆𝒓 𝒀𝒐𝒖𝒓 𝑨𝒑𝒊 𝑯𝒂𝒔𝒉",
+            "value": "5e7c4088f8e23d0ab61e29ae11960bf5",
+            "required": true
+        },
+        "BOT_TOKEN": {
+            "description": "𝑬𝒏𝒕𝒆𝒓 𝒀𝒐𝒖𝒓 𝑩𝒐𝒕 𝑻𝒐𝒌𝒆𝒏",
+            "value": "",
+            "required": true
+        },
+        "OWNER": {
+            "description": "𝙀𝙣𝙩𝙚𝙧 𝙔𝙤𝙪𝙧 𝙏𝙚𝙡𝙚𝙜𝙧𝙖𝙢 𝙄𝘿",
+            "value": "5680454765",
+            "required": true
+        },
+        "CREDIT": {
+            "description": "𝙀𝙣𝙩𝙚𝙧 𝘾𝙧𝙚𝙙𝙞𝙩 𝙉𝙖𝙢𝙚 𝙞𝙣 𝙖𝙡𝙢𝙤𝙨𝙩 6-8 𝙡𝙚𝙩𝙩𝙚𝙧𝙨",
+            "value": "𝙎𝘼𝙄𝙉𝙄 𝘽𝙊𝙏𝙎",
+            "required": true
+        },
+        "MONGO_URL": {
+            "description": "𝙀𝙣𝙩𝙚𝙧 𝙔𝙤𝙪𝙧 𝙈𝙤𝙣𝙜𝙤𝘿𝘽 𝙐𝙍𝙇 (mongodb+srv://...)",
+            "value": "",
+            "required": true
+        },
+        "VIMEO_WORKER_URL": {
+            "description": "𝙀𝙣𝙩𝙚𝙧 𝙔𝙤𝙪𝙧 𝘾𝙡𝙤𝙪𝙙𝙛𝙡𝙖𝙧𝙚 𝙒𝙤𝙧𝙠𝙚𝙧 𝙐𝙍𝙇 𝙛𝙤𝙧 𝙑𝙞𝙢𝙚𝙤 (https://vimeo-extractor.yourname.workers.dev)",
+            "value": "",
+            "required": false
+        }
+    },
+    "formation": {
+        "worker": {
+            "quantity": 1,
+            "size": "standard-2x"
+        }
+    },
+    "addons": [],
+    "buildpacks": [
+        {
+            "url": "https://github.com/amivin/aria2-heroku.git"
+        },
+        {
+            "url": "heroku/python"
+        },
+        {
+            "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
+        }
+    ]
+}
