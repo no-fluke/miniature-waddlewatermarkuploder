@@ -33,6 +33,8 @@ _WM_EDGE_MARGIN = 0.08   # 8% from each edge
 # Falls back through common locations; last resort uses no fontfile= (may still fail).
 def _resolve_font() -> str:
     candidates = [
+        "DejaVuSans.ttf",                                    # bundled in repo root
+        "/app/DejaVuSans.ttf",                              # Heroku /app path
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
@@ -46,32 +48,6 @@ def _resolve_font() -> str:
     for p in candidates:
         if os.path.exists(p):
             return p
-    # Try fc-list to find any installed .ttf font
-    try:
-        result = subprocess.run(
-            ["fc-list", "--format=%{file}\n"],
-            capture_output=True, text=True, timeout=5
-        )
-        for line in result.stdout.strip().splitlines():
-            line = line.strip()
-            if line.endswith(".ttf") and os.path.exists(line):
-                print(f"[watermark] Found system font via fc-list: {line}")
-                return line
-    except Exception:
-        pass
-    # Try finding any .ttf under /usr/share/fonts
-    try:
-        result = subprocess.run(
-            ["find", "/usr/share/fonts", "-name", "*.ttf", "-type", "f"],
-            capture_output=True, text=True, timeout=5
-        )
-        for line in result.stdout.strip().splitlines():
-            line = line.strip()
-            if os.path.exists(line):
-                print(f"[watermark] Found font via find: {line}")
-                return line
-    except Exception:
-        pass
     return ""   # no font found — watermark will be skipped
 
 _WM_FONT = _resolve_font()
@@ -112,11 +88,10 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
         print(f"[watermark] Video too short ({duration:.1f}s) — skipping overlay")
         return input_file
 
-    # Re-resolve font each call in case it was downloaded after startup
-    font = _WM_FONT or _resolve_font()
-    if not font:
+    if not _WM_FONT:
         print(f"[watermark] No font available — skipping overlay")
         return input_file
+    font = _WM_FONT
 
     # ── 2. Font size relative to frame width (scales nicely across resolutions)
     fontsize = max(22, int(vid_w * 0.028))   # ~2.8% of width, min 22 px
