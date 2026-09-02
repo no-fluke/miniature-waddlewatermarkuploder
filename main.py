@@ -1200,6 +1200,22 @@ async def txt_handler(bot: Client, m: Message):
     else:
         thumb = raw_text6
 
+    # ── Watermark option for TXT batch ───────────────────────────────────────
+    await editable.edit(
+        f"🖊️ Add background watermark?\n\n"
+        f"<blockquote>Send your watermark text (e.g. <code>@YourChannel</code>)\n"
+        f"or send /d to skip</blockquote>"
+    )
+    try:
+        input_wm: Message = await bot.listen(editable.chat.id, filters.text & filters.user(m.from_user.id), timeout=20)
+        raw_wm = input_wm.text.strip()
+        await input_wm.delete(True)
+    except asyncio.TimeoutError:
+        raw_wm = '/d'
+
+    batch_watermark = None if raw_wm == '/d' else raw_wm
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Channel selection ─────────────────────────────────────────────────────
     await editable.edit(
         f"__**⚠️ Provide the Channel ID or send /d to upload here**__"
@@ -1538,7 +1554,7 @@ async def txt_handler(bot: Client, m: Message):
                     filename = res_file  
                     await prog1.delete(True)
                     await prog.delete(True)
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id)
+                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id, watermark_text=batch_watermark)
                     count += 1  
                     await asyncio.sleep(1)  
                     continue  
@@ -1571,7 +1587,7 @@ async def txt_handler(bot: Client, m: Message):
                     filename = res_file
                     await prog1.delete(True)
                     await prog.delete(True)
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id)
+                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id, watermark_text=batch_watermark)
                     count += 1
                     await asyncio.sleep(1)
                     continue
@@ -1604,7 +1620,7 @@ async def txt_handler(bot: Client, m: Message):
                     filename = res_file
                     await prog1.delete(True)
                     await prog.delete(True)
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id)
+                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id, watermark_text=batch_watermark)
                     count += 1
                     time.sleep(1)
                 
@@ -1673,7 +1689,24 @@ async def text_handler(bot: Client, m: Message):
                 res = "UN"
           
         await editable.delete()
-        
+
+        # ── Watermark option for single link ────────────────────────────────────
+        editable = await m.reply_text(
+            f"🖊️ Add background watermark?\n\n"
+            f"<blockquote>Send your watermark text (e.g. <code>@YourChannel</code>)\n"
+            f"or send /d to skip</blockquote>"
+        )
+        try:
+            input_wm: Message = await bot.listen(editable.chat.id, filters.text & filters.user(m.from_user.id), timeout=20)
+            raw_wm = input_wm.text.strip()
+            await input_wm.delete(True)
+        except asyncio.TimeoutError:
+            raw_wm = '/d'
+
+        single_watermark = None if raw_wm == '/d' else raw_wm
+        await editable.delete()
+        # ─────────────────────────────────────────────────────────────────────────
+
     raw_text4 = "working_token"
     thumb = "/d"
     count =0
@@ -1886,7 +1919,7 @@ async def text_handler(bot: Client, m: Message):
                     res_file = await helper.download_and_decrypt_video(url, cmd, name, appxkey)  
                     filename = res_file  
                     await prog.delete(True)  
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id)
+                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id, watermark_text=single_watermark)
                     await asyncio.sleep(1)  
                     pass
 
@@ -1898,7 +1931,7 @@ async def text_handler(bot: Client, m: Message):
                     res_file = await helper.decrypt_and_merge_video(mpd, keys_string, path, name, raw_text2)
                     filename = res_file
                     await prog.delete(True)
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id)
+                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id, watermark_text=single_watermark)
                     await asyncio.sleep(1)
                     pass
      
@@ -1910,7 +1943,7 @@ async def text_handler(bot: Client, m: Message):
                     res_file = await helper.download_video(url, cmd, name)
                     filename = res_file
                     await prog.delete(True)
-                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id)
+                    await helper.send_vid(bot, m, cc, filename, thumb, name, prog, channel_id, topic_id=current_topic_id, watermark_text=single_watermark)
                     time.sleep(1)
 
             except Exception as e:
