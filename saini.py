@@ -54,13 +54,18 @@ _WM_FONT = _resolve_font()
 
 def add_random_text_overlay(input_file: str, output_file: str, text: str, progress_callback=None) -> str:
     """
-    Burns a transparent text watermark (white + black outline, NO background box)
-    into a video at random positions and random time intervals.
+    Burns a CONTINUOUSLY WANDERING text watermark into a video.
 
-    • Each burst: text appears for 3 s at a NEW random (x, y) on screen.
-    • Gaps between bursts: random 10–150 s.
-    • Quality: uses -crf 18 (visually lossless). Audio is always copied.
-    • Returns output_file on success, or input_file on any failure (safe fallback).
+    The watermark moves smoothly across the entire frame at all times using
+    FFmpeg's drawtext expressions — no gaps, always visible, always moving.
+
+    Motion model (pure FFmpeg math expressions — no per-frame Python):
+      • Two sine waves with incommensurable periods drive X and Y independently,
+        producing a Lissajous-like path that never repeats within normal video lengths.
+      • The watermark bounces across the full safe area of the frame.
+
+    Quality: -crf 23 (good quality, reasonable file size). Audio is always copied.
+    Returns output_file on success, or input_file on any failure (safe fallback).
     """
     # ── 1. Probe duration + resolution ──────────────────────────────────────
     try:
@@ -76,7 +81,6 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
             capture_output=True, text=True, timeout=30,
         )
         lines = [l.strip() for l in probe.stdout.strip().splitlines() if l.strip()]
-        # ffprobe outputs: width, height, duration  (order matches show_entries)
         vid_w    = int(lines[0])   if len(lines) > 0 else 1280
         vid_h    = int(lines[1])   if len(lines) > 1 else 720
         duration = float(lines[2]) if len(lines) > 2 else 0.0
@@ -84,7 +88,7 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
         print(f"[watermark] ffprobe failed: {e} — skipping overlay")
         return input_file
 
-    if duration < 15:
+    if duration < 5:
         print(f"[watermark] Video too short ({duration:.1f}s) — skipping overlay")
         return input_file
 
@@ -93,40 +97,39 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
         return input_file
     font = _WM_FONT
 
-    # ── 2. Font size relative to frame width (scales nicely across resolutions)
+    # ── 2. Font size relative to frame width ─────────────────────────────────
     fontsize = max(22, int(vid_w * 0.028))   # ~2.8% of width, min 22 px
 
-    # Rough character width estimate: ~60% of fontsize per char
-    text_w_est = len(text) * fontsize * 0.60
-    text_h_est = fontsize * 1.2
+    # Rough text size estimate (used to keep text fully inside frame)
+    text_w_est = int(len(text) * fontsize * 0.60)
+    text_h_est = int(fontsize * 1.2)
 
-    # Safe drawable area (in pixels, accounting for edge margin)
+    # Safe drawable area in pixels
     margin_x = int(vid_w * _WM_EDGE_MARGIN)
     margin_y = int(vid_h * _WM_EDGE_MARGIN)
     safe_x_min = margin_x
-    safe_x_max = max(margin_x, int(vid_w - margin_x - text_w_est))
+    safe_x_max = max(margin_x + 1, vid_w - margin_x - text_w_est)
     safe_y_min = margin_y
-    safe_y_max = max(margin_y, int(vid_h - margin_y - text_h_est))
+    safe_y_max = max(margin_y + 1, vid_h - margin_y - text_h_est)
 
-    # ── 3. Build random appearance windows with a unique (x, y) per burst ───
-    SHOW_DURATION = 3
-    MIN_GAP       = 10
-    MAX_GAP       = 150
+    # Range of motion (half-amplitude for sine waves)
+    range_x = (safe_x_max - safe_x_min) / 2
+    range_y = (safe_y_max - safe_y_min) / 2
+    cx = safe_x_min + range_x   # centre X
+    cy = safe_y_min + range_y   # centre Y
 
-    appearances = []   # list of (start, end, x, y)
-    t = random.uniform(MIN_GAP, MAX_GAP)
-    while t + SHOW_DURATION < duration:
-        rx = random.randint(safe_x_min, safe_x_max)
-        ry = random.randint(safe_y_min, safe_y_max)
-        appearances.append((t, t + SHOW_DURATION, rx, ry))
-        t += SHOW_DURATION + random.uniform(MIN_GAP, MAX_GAP)
+    # ── 3. Wandering speed — incommensurable periods so path never repeats ────
+    # Period in seconds for one full oscillation. Use irrational ratio (√2 ≈ 1.4142)
+    # so X and Y are never in sync → covers all quadrants over time.
+    period_x = random.uniform(7, 13)           # e.g. 7–13 s per X cycle
+    period_y = period_x * 1.4142135623730951   # √2 × period_x
 
-    if not appearances:
-        print(f"[watermark] No burst windows fit in {duration:.1f}s — skipping")
-        return input_file
+    # Random phase offset so different videos start at different positions
+    phase_x = random.uniform(0, 6.2832)
+    phase_y = random.uniform(0, 6.2832)
 
-    print(f"[watermark] {len(appearances)} burst(s) across {duration:.1f}s "
-          f"at {vid_w}x{vid_h}, fontsize={fontsize}")
+    print(f"[watermark] wandering overlay at {vid_w}x{vid_h}, fontsize={fontsize}, "
+          f"period_x={period_x:.1f}s, period_y={period_y:.1f}s")
 
     # ── 4. Escape text for FFmpeg drawtext ───────────────────────────────────
     safe_text = (
@@ -136,54 +139,53 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
         .replace(":",  "\\:")
     )
 
-    # ── 5. Build drawtext layers ─────────────────────────────────────────────
-    # fontfile= must be set explicitly on servers without fontconfig (Heroku, Render, etc.)
-    # Escape colons in the path so FFmpeg's filter parser doesn't misread it.
+    # ── 5. Build the wandering drawtext filter ───────────────────────────────
+    # FFmpeg drawtext supports arithmetic expressions for x/y evaluated per-frame.
+    # sin() argument is in radians. 2*PI/period gives angular frequency.
+    #   x = cx + range_x * sin(2π/period_x * t + phase_x)
+    #   y = cy + range_y * sin(2π/period_y * t + phase_y)
+    # We use 6.2832 ≈ 2π
+
     fontfile_clause = (
-        f":fontfile='{font.replace(':', '\\:')}'" if font else ""
+        f":fontfile='{font.replace(chr(58), chr(92) + chr(58))}'" if font else ""
     )
 
-    drawtext_layers = []
-    for (s, e, rx, ry) in appearances:
-        enable = f"between(t,{s:.2f},{e:.2f})"
-        layer = (
-            f"drawtext="
-            f"text='{safe_text}'"
-            f"{fontfile_clause}"        # ← explicit font path, no fontconfig needed
-            f":fontsize={fontsize}"
-            f":fontcolor=white@0.4"     # watermark opacity
-            f":x={rx}"
-            f":y={ry}"
-            f":enable='{enable}'"
-        )
-        drawtext_layers.append(layer)
+    # FFmpeg expression for continuously moving position
+    x_expr = f"{cx:.1f}+{range_x:.1f}*sin(6.2832/{period_x:.4f}*t+{phase_x:.4f})"
+    y_expr = f"{cy:.1f}+{range_y:.1f}*sin(6.2832/{period_y:.4f}*t+{phase_y:.4f})"
 
-    dt_chain = ",".join(drawtext_layers)
+    # Single drawtext filter — always visible, always moving
+    drawtext_filter = (
+        f"drawtext="
+        f"text='{safe_text}'"
+        f"{fontfile_clause}"
+        f":fontsize={fontsize}"
+        f":fontcolor=white@0.55"
+        f":shadowcolor=black@0.55"
+        f":shadowx=2"
+        f":shadowy=2"
+        f":x={x_expr}"
+        f":y={y_expr}"
+    )
 
-    # Simple direct drawtext — no blend, no color distortion, no pink tint
-    filter_complex = f"[0:v]{dt_chain}[out]"
+    # vf filter chain: force yuv420p so output plays on ALL players/devices
+    # yuv420p is required for Telegram, WhatsApp, iOS, Android compatibility
+    filter_chain = f"{drawtext_filter},format=yuv420p"
 
     # ── 6. Run FFmpeg with progress tracking ─────────────────────────────────
-    filter_file = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        ) as tf:
-            tf.write(filter_complex)
-            filter_file = tf.name
-
         process = subprocess.Popen(
             [
                 "ffmpeg", "-y",
                 "-i", input_file,
-                "-filter_complex_script", filter_file,
-                "-map", "[out]",
-                "-map", "0:a?",
+                "-vf", filter_chain,
                 "-c:v", "libx264",
-                "-crf", "18",
+                "-crf", "23",           # good quality, smaller than crf 18
                 "-preset", "fast",
-                "-c:a", "copy",              # ✅ Copy audio – no quality loss
-                "-movflags", "+faststart",   # makes video playable while downloading
+                "-profile:v", "baseline",   # widest device compatibility
+                "-level", "3.1",
+                "-c:a", "copy",             # copy audio — no quality loss
+                "-movflags", "+faststart",  # MP4 moov atom at front → plays while downloading
                 "-progress", "pipe:1",
                 output_file,
             ],
@@ -193,7 +195,6 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
         )
 
         last_pct = -1
-        stderr_lines = []
         while True:
             line = process.stdout.readline()
             if not line and process.poll() is not None:
@@ -211,7 +212,7 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
 
         process.wait(timeout=3600)
         if process.returncode != 0:
-            err = process.stderr.read()[-1200:] if process.stderr else ""
+            err = process.stderr.read()[-2000:] if process.stderr else ""
             print(f"[watermark] FFmpeg error (code {process.returncode}):\n{err}")
             return input_file
         print(f"[watermark] Done → {output_file}")
@@ -219,9 +220,6 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
     except Exception as ex:
         print(f"[watermark] Exception: {ex}")
         return input_file
-    finally:
-        if filter_file and os.path.exists(filter_file):
-            os.remove(filter_file)
 
 
 # ─── Helpers used by main.py ──────────────────────────────────────────────────
