@@ -28,22 +28,50 @@ from base64 import b64decode
 # Margin kept away from edges so text is never clipped (fraction of frame size)
 _WM_EDGE_MARGIN = 0.08   # 8% from each edge
 
-# Explicit font path — avoids "Cannot find a valid font for the family Sans"
-# on minimal servers where fontconfig is not configured.
-# Falls back through common locations; last resort uses no fontfile= (may still fail).
+# ── Font resolution ──────────────────────────────────────────────────────────
+# drawtext REQUIRES a font file on servers where fontconfig is absent/broken
+# (Heroku, Render, Railway dynos, etc.).  We try local paths first, then
+# download a small OFL font to /tmp once and reuse it for the process lifetime.
+
+_WM_FONT_CACHE = "/tmp/_wm_font_LiberationSans.ttf"
+
+_WM_FONT_LOCAL_CANDIDATES = [
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "C:/Windows/Fonts/arial.ttf",
+]
+
+# Direct raw download URLs for LiberationSans (OFL licence, tiny ~400 KB)
+_WM_FONT_URLS = [
+    "https://github.com/liberationfonts/liberation-fonts/raw/main/liberation-fonts-ttf-2.1.5/LiberationSans-Regular.ttf",
+    "https://raw.githubusercontent.com/liberationfonts/liberation-fonts/main/liberation-fonts-ttf-2.1.5/LiberationSans-Regular.ttf",
+]
+
 def _resolve_font() -> str:
-    candidates = [
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",          # macOS fallback
-        "C:/Windows/Fonts/arial.ttf",                   # Windows fallback
-    ]
-    for p in candidates:
+    # 1. already downloaded this session
+    if os.path.exists(_WM_FONT_CACHE):
+        return _WM_FONT_CACHE
+    # 2. system font present
+    for p in _WM_FONT_LOCAL_CANDIDATES:
         if os.path.exists(p):
+            print(f"[watermark] Using system font: {p}")
             return p
-    return ""   # empty → omit fontfile= and hope for the best
+    # 3. download to /tmp (happens once per dyno boot)
+    import urllib.request
+    for url in _WM_FONT_URLS:
+        try:
+            print(f"[watermark] Downloading font from {url} …")
+            urllib.request.urlretrieve(url, _WM_FONT_CACHE)
+            if os.path.getsize(_WM_FONT_CACHE) > 10_000:
+                print(f"[watermark] Font cached at {_WM_FONT_CACHE}")
+                return _WM_FONT_CACHE
+        except Exception as e:
+            print(f"[watermark] Font download failed ({url}): {e}")
+    print("[watermark] WARNING: no font found — drawtext will likely fail")
+    return ""
 
 _WM_FONT = _resolve_font()
 
