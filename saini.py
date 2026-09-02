@@ -121,7 +121,7 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str, progre
     # ── 3. Wandering speed — incommensurable periods so path never repeats ────
     # Period in seconds for one full oscillation. Use irrational ratio (√2 ≈ 1.4142)
     # so X and Y are never in sync → covers all quadrants over time.
-    period_x = random.uniform(7, 13)           # e.g. 7–13 s per X cycle
+    period_x = random.uniform(60, 90)           # e.g. 7–13 s per X cycle
     period_y = period_x * 1.4142135623730951   # √2 × period_x
 
     # Random phase offset so different videos start at different positions
