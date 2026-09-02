@@ -3,6 +3,7 @@ import re
 import time
 import mmap
 import random
+import tempfile
 import datetime
 import aiohttp
 import aiofiles
@@ -148,12 +149,24 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
     )
 
     # ── 6. Run FFmpeg ─────────────────────────────────────────────────────────
+    #
+    # With many bursts (e.g. 55) the filter_complex string can exceed the OS
+    # ARG_MAX limit and FFmpeg reports "No such file or directory" on the
+    # -filter_complex argument itself.  Writing the filter to a temp file and
+    # using -filter_complex_script removes that limit entirely.
+    filter_file = None
     try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as tf:
+            tf.write(filter_complex)
+            filter_file = tf.name
+
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-i", input_file,
-                "-filter_complex", filter_complex,
+                "-filter_complex_script", filter_file,   # ← no ARG_MAX limit
                 "-map", "[out]",
                 "-map", "0:a?",       # pass audio through if present
                 "-c:v", "libx264",
@@ -173,6 +186,9 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
     except Exception as ex:
         print(f"[watermark] Exception: {ex}")
         return input_file
+    finally:
+        if filter_file and os.path.exists(filter_file):
+            os.remove(filter_file)
 
 
 # ─── Helpers used by main.py ──────────────────────────────────────────────────
