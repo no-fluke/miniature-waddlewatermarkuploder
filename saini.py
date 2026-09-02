@@ -52,7 +52,7 @@ def _resolve_font() -> str:
 
 _WM_FONT = _resolve_font()
 
-def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str:
+def add_random_text_overlay(input_file: str, output_file: str, text: str, progress_callback=None) -> str:
     """
     Burns a transparent text watermark (white + black outline, NO background box)
     into a video at random positions and random time intervals.
@@ -136,18 +136,7 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
         .replace(":",  "\\:")
     )
 
-    # ── 5. Build drawtext layers on a transparent clone ─────────────────────
-    #
-    # How the background watermark works:
-    #   • We duplicate the video into two streams: [vid] and [ghost].
-    #   • On [ghost] we draw the text at very low opacity (white@0.15).
-    #   • We then blend [ghost] UNDER [vid] using 'addition' mode so only
-    #     the faint text signal leaks through — the video pixels are dominant.
-    #   • Result: text appears to glow softly from behind the video content,
-    #     like a TV channel watermark, without covering anything.
-    #
-    # Opacity knob: fontcolor=white@0.15  (raise to @0.25 for more visible)
-
+    # ── 5. Build drawtext layers ─────────────────────────────────────────────
     # fontfile= must be set explicitly on servers without fontconfig (Heroku, Render, etc.)
     # Escape colons in the path so FFmpeg's filter parser doesn't misread it.
     fontfile_clause = (
@@ -162,7 +151,7 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
             f"text='{safe_text}'"
             f"{fontfile_clause}"        # ← explicit font path, no fontconfig needed
             f":fontsize={fontsize}"
-            f":fontcolor=white@0.15"    # ghost opacity — tweak to taste
+            f":fontcolor=white@0.4"     # watermark opacity
             f":x={rx}"
             f":y={ry}"
             f":enable='{enable}'"
@@ -171,24 +160,10 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
 
     dt_chain = ",".join(drawtext_layers)
 
-    # filter_complex:
-    #   1. split input into [vid] (original) and [base] (copy for ghost text)
-    #   2. draw all burst text layers onto [base] → [ghost]
-    #   3. blend: [vid] + [ghost] with addition mode
-    #      addition blend = each pixel: out = min(vid + ghost, 1.0)
-    #      since ghost pixels are nearly black except faint white text,
-    #      only the text area adds a tiny brightness → looks like background glow
-    filter_complex = (
-        f"[0:v]split=2[vid][base];"
-        f"[base]{dt_chain}[ghost];"
-        f"[vid][ghost]blend=all_mode=addition:all_opacity=1[out]"
-    )
+    # Simple direct drawtext — no blend, no color distortion, no pink tint
+    filter_complex = f"[0:v]{dt_chain}[out]"
 
-    # ── 6. Run FFmpeg ─────────────────────────────────────────────────────────
-    #
-    # Use -filter_complex_script instead of -filter_complex to avoid ARG_MAX.
-    # With 55 bursts the filter string is ~15 KB — far beyond what the OS
-    # allows as a single shell argument on some platforms (Heroku dynos, etc.).
+    # ── 6. Run FFmpeg with progress tracking ─────────────────────────────────
     filter_file = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -197,24 +172,46 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
             tf.write(filter_complex)
             filter_file = tf.name
 
-        result = subprocess.run(
+        process = subprocess.Popen(
             [
                 "ffmpeg", "-y",
                 "-i", input_file,
-                "-filter_complex_script", filter_file,  # ← no ARG_MAX limit
+                "-filter_complex_script", filter_file,
                 "-map", "[out]",
-                "-map", "0:a?",       # pass audio through if present
+                "-map", "0:a?",
                 "-c:v", "libx264",
-                "-crf", "18",         # visually lossless
+                "-crf", "18",
                 "-preset", "fast",
-                "-c:a", "copy",       # audio never re-encoded
+                "-c:a", "copy",
+                "-progress", "pipe:1",  # stream progress to stdout
                 output_file,
             ],
-            capture_output=True, text=True, timeout=3600,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        if result.returncode != 0:
-            print(f"[watermark] FFmpeg error (code {result.returncode}):\n"
-                  f"{result.stderr[-1200:]}")
+
+        last_pct = -1
+        stderr_lines = []
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            line = line.strip()
+            if line.startswith("out_time_ms="):
+                try:
+                    out_ms = int(line.split("=")[1])
+                    pct = min(100, int((out_ms / 1000) / duration * 100))
+                    if pct != last_pct and progress_callback:
+                        progress_callback(pct)
+                        last_pct = pct
+                except Exception:
+                    pass
+
+        process.wait(timeout=3600)
+        if process.returncode != 0:
+            err = process.stderr.read()[-1200:] if process.stderr else ""
+            print(f"[watermark] FFmpeg error (code {process.returncode}):\n{err}")
             return input_file
         print(f"[watermark] Done → {output_file}")
         return output_file
@@ -573,16 +570,43 @@ async def send_vid(
         base, ext = os.path.splitext(filename)
         wm_output = f"{base}_wm{ext or '.mp4'}"
         status_msg = await m.reply_text(
-            f"🖊️ **Adding watermark...**\n<blockquote>{name}</blockquote>"
+            f"🖊️ **Adding Watermark...**\n"
+            f"<blockquote>{name}</blockquote>\n"
+            f"⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 0%"
         )
-        # Run blocking FFmpeg in executor so the event loop isn't blocked
+
+        last_pct_sent = [-1]
+
+        async def update_progress(pct):
+            if pct == last_pct_sent[0]:
+                return
+            last_pct_sent[0] = pct
+            filled = int(pct / 10)
+            bar = "🟩" * filled + "⬜" * (10 - filled)
+            try:
+                await status_msg.edit_text(
+                    f"🖊️ **Adding Watermark...**\n"
+                    f"<blockquote>{name}</blockquote>\n"
+                    f"{bar} {pct}%"
+                )
+            except Exception:
+                pass
+
+        def sync_progress_callback(pct):
+            asyncio.run_coroutine_threadsafe(update_progress(pct), loop)
+
         loop = asyncio.get_event_loop()
         watermarked = await loop.run_in_executor(
-            None, add_random_text_overlay, filename, wm_output, watermark_text
+            None, add_random_text_overlay, filename, wm_output, watermark_text, sync_progress_callback
         )
+        await status_msg.edit_text(
+            f"🖊️ **Watermark Done ✅**\n"
+            f"<blockquote>{name}</blockquote>\n"
+            f"🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%"
+        )
+        await asyncio.sleep(1)
         await status_msg.delete()
         if watermarked != filename:
-            # Overlay succeeded — remove the original, use watermarked copy
             try:
                 os.remove(filename)
             except OSError:
