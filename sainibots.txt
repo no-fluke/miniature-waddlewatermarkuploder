@@ -1,54 +1,67 @@
-# saini bots
-async-lru==2.0.2
-certifi==2023.5.7
-charset-normalizer==3.1.0
-idna==3.4
-mutagen==1.46.0
-pyaes==1.6.1
-pycryptodome==3.18.0
+# ─── Telegram Bot Framework ───────────────────────────────────────────────────
 pyrofork==2.3.69
 TgCrypto-pyrofork
 pyromod==1.5
-PySocks==1.7.1
-python-dotenv==1.0.0
-python-telegram-bot==20.3
-requests==2.31.0
-soupsieve==2.4.1
 
-urllib3==2.0.3
-websockets==11.0.3
-yt-dlp
-motor
+# ─── Async HTTP / File I/O ────────────────────────────────────────────────────
 aiohttp
 aiofiles
-pytz
-pillow
+
+# ─── Video / Media ────────────────────────────────────────────────────────────
+yt-dlp
+youtube-dl
+pytube
+ffmpeg-python
+ffmpeg
 m3u8
+
+# ─── Crypto ───────────────────────────────────────────────────────────────────
+pycryptodome==3.18.0
+pyaes==1.6.1
+cryptography
+PyJWT
+pyopenssl
+
+# ─── Web Scraping ─────────────────────────────────────────────────────────────
+beautifulsoup4
+soupsieve==2.4.1
+cloudscraper
+requests==2.31.0
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+pymongo[srv]
+motor
 umongo==3.1.0
-speedtest-cli
+certifi==2023.5.7
+
+# ─── Web Server (keepalive) ───────────────────────────────────────────────────
 Flask==1.1.2
 gunicorn==21.2.0
 Jinja2==3.0.3
 werkzeug==2.0.2
 itsdangerous==2.0.1
-ffmpeg
-youtube-dl
-cloudscraper
-cryptography
-PyJWT
-sqlalchemy
-pyopenssl
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+colorama
+pytz
+pillow
+mutagen==1.46.0
+async-lru==2.0.2
+charset-normalizer==3.1.0
+idna==3.4
+PySocks==1.7.1
+python-dotenv==1.0.0
+urllib3==2.0.3
+websockets==11.0.3
 wget
-beautifulsoup4
 reportlab
-pytube
+speedtest-cli
+sqlalchemy
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
 google-api-python-client
-ffmpeg-python
+python-telegram-bot==20.3
 
-colorama
-
-# 🔑 Stability fix
+# ─── Stability fix ────────────────────────────────────────────────────────────
 setuptools<81
