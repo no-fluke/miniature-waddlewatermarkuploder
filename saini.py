@@ -33,7 +33,7 @@ _WM_EDGE_MARGIN = 0.08   # 8% from each edge
 # (Heroku, Render, Railway dynos, etc.).  We try local paths first, then
 # download a small OFL font to /tmp once and reuse it for the process lifetime.
 
-_WM_FONT_CACHE = "/tmp/_wm_font_LiberationSans.ttf"
+_WM_FONT_CACHE = "/tmp/_wm_font_DejaVuSans.ttf"
 
 _WM_FONT_LOCAL_CANDIDATES = [
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -44,10 +44,10 @@ _WM_FONT_LOCAL_CANDIDATES = [
     "C:/Windows/Fonts/arial.ttf",
 ]
 
-# Direct raw download URLs for LiberationSans (OFL licence, tiny ~400 KB)
+# Direct raw download URLs (OFL licence) — tested working
 _WM_FONT_URLS = [
-    "https://github.com/liberationfonts/liberation-fonts/raw/main/liberation-fonts-ttf-2.1.5/LiberationSans-Regular.ttf",
-    "https://raw.githubusercontent.com/liberationfonts/liberation-fonts/main/liberation-fonts-ttf-2.1.5/LiberationSans-Regular.ttf",
+    "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
+    "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf",
 ]
 
 def _resolve_font() -> str:
