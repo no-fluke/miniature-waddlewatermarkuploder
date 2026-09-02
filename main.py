@@ -249,12 +249,18 @@ async def broadusers_handler(client: Client, message: Message):
         except Exception:
             user_infos.append(f"[{user_id}](tg://openmessage?user_id={user_id})")
     total = len(user_infos)
-    text = (
-        f"<blockquote><b>Total Users: {total}</b></blockquote>\n\n"
-        "<b>Users List:</b>\n"
-        + "\n".join(user_infos)
-    )
-    await message.reply_text(text)
+    # Telegram message limit is 4096 chars. Chunk the list to avoid MESSAGE_TOO_LONG.
+    CHUNK_SIZE = 50   # send 50 users per message
+    header_sent = False
+    for i in range(0, max(1, total), CHUNK_SIZE):
+        chunk = user_infos[i:i + CHUNK_SIZE]
+        if not header_sent:
+            header = f"<blockquote><b>Total Users: {total}</b></blockquote>\n\n<b>Users List:</b>\n"
+            header_sent = True
+        else:
+            header = f"<b>Users (continued {i+1}–{min(i+CHUNK_SIZE, total)}):</b>\n"
+        text = header + "\n".join(chunk)
+        await message.reply_text(text)
 
 @bot.on_message(filters.command("cookies") & filters.private)
 async def cookies_handler(client: Client, m: Message):
