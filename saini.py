@@ -71,8 +71,8 @@ def add_random_text_overlay(
     When called per-chunk, pass time_offset + shared wave params so the
     watermark position is seamless across chunk boundaries.
 
-    Encoding: -qp 0 (lossless x264) so chunks can be concat'd with -c copy
-    without any quality loss or re-encode at the join points.
+    Encoding: -crf 12 (near-lossless x264, yuv420p) so chunks can be
+    concat'd with -c copy without visible quality loss at the join points.
     """
     # ── 1. Probe resolution (duration comes from caller for chunks) ───────────
     try:
@@ -175,10 +175,13 @@ def add_random_text_overlay(
     filter_chain = f"{drawtext_filter},format=yuv420p"
 
     # ── 6. FFmpeg encode ──────────────────────────────────────────────────────
-    # -qp 0  → lossless x264 (no quality loss, larger file than crf 23 but
-    #           identical pixel values — safe for -c copy concat afterwards)
-    # -preset ultrafast → fastest encode at qp 0 (lossless doesn't benefit
-    #           from slower presets the way lossy does)
+    # -crf 12   → near-lossless x264 (visually identical to source).
+    #             Replaces the broken -qp 0 + -profile:v high combo:
+    #             x264 lossless requires high444 profile but yuv420p needs
+    #             high profile — those two constraints are mutually exclusive.
+    # -preset ultrafast → fastest encode; fine for near-lossless crf.
+    # No -profile:v flag → x264 auto-selects "high" for yuv420p, which is
+    #             correct and compatible with all players and -c copy concat.
     try:
         process = subprocess.Popen(
             [
@@ -186,9 +189,9 @@ def add_random_text_overlay(
                 "-i", input_file,
                 "-vf", filter_chain,
                 "-c:v", "libx264",
-                "-qp", "0",              # ← LOSSLESS (no quality loss)
-                "-preset", "ultrafast",  # ← fastest encode for lossless
-                "-profile:v", "high",    # high profile required for lossless
+                "-crf", "12",            # ← near-lossless (replaces broken -qp 0)
+                "-preset", "ultrafast",  # ← fastest encode
+                                         # NO -profile:v — auto = "high" for yuv420p
                 "-c:a", "copy",
                 "-movflags", "+faststart",
                 "-progress", "pipe:1",
@@ -263,13 +266,13 @@ def add_watermark_parallel(
     workers: int = None,         # defaults to os.cpu_count()
 ) -> str:
     """
-    Fast, lossless parallel watermarking pipeline:
+    Fast, near-lossless parallel watermarking pipeline:
 
       1. Split input into chunks with -c copy  (instant, no re-encode)
-      2. Watermark each chunk in parallel with -qp 0 (lossless x264)
+      2. Watermark each chunk in parallel with -crf 12 (near-lossless x264)
          — wave params shared so motion is seamless across boundaries
       3. Concat watermarked chunks with -c copy (instant, no re-encode)
-      4. Final output: same quality as source, watermark burned in
+      4. Final output: visually identical to source, watermark burned in
 
     Falls back to single-pass add_random_text_overlay on any error.
     """
@@ -376,8 +379,8 @@ def add_watermark_parallel(
             progress_callback(90)
 
         # ── Step 6: Concat with -c copy (no re-encode, no quality loss) ───────
-        # This works losslessly because every chunk was encoded with the same
-        # codec (-c:v libx264 -qp 0) and the same profile/level.
+        # Works because every chunk uses the same codec params:
+        # libx264 / crf 12 / yuv420p / auto-profile (high).
         filelist_path = os.path.join(tmp_dir, "filelist.txt")
         with open(filelist_path, "w") as f:
             for wm_chunk in wm_chunks:
