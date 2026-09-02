@@ -28,6 +28,25 @@ from base64 import b64decode
 # Margin kept away from edges so text is never clipped (fraction of frame size)
 _WM_EDGE_MARGIN = 0.08   # 8% from each edge
 
+# Explicit font path — avoids "Cannot find a valid font for the family Sans"
+# on minimal servers where fontconfig is not configured.
+# Falls back through common locations; last resort uses no fontfile= (may still fail).
+def _resolve_font() -> str:
+    candidates = [
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",          # macOS fallback
+        "C:/Windows/Fonts/arial.ttf",                   # Windows fallback
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return ""   # empty → omit fontfile= and hope for the best
+
+_WM_FONT = _resolve_font()
+
 def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str:
     """
     Burns a transparent text watermark (white + black outline, NO background box)
@@ -119,12 +138,19 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
     #
     # Opacity knob: fontcolor=white@0.15  (raise to @0.25 for more visible)
 
+    # fontfile= must be set explicitly on servers without fontconfig (Heroku, Render, etc.)
+    # Escape colons in the path so FFmpeg's filter parser doesn't misread it.
+    fontfile_clause = (
+        f":fontfile='{_WM_FONT.replace(':', '\\:')}'" if _WM_FONT else ""
+    )
+
     drawtext_layers = []
     for (s, e, rx, ry) in appearances:
         enable = f"between(t,{s:.2f},{e:.2f})"
         layer = (
             f"drawtext="
             f"text='{safe_text}'"
+            f"{fontfile_clause}"        # ← explicit font path, no fontconfig needed
             f":fontsize={fontsize}"
             f":fontcolor=white@0.15"    # ghost opacity — tweak to taste
             f":x={rx}"
@@ -150,10 +176,9 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
 
     # ── 6. Run FFmpeg ─────────────────────────────────────────────────────────
     #
-    # With many bursts (e.g. 55) the filter_complex string can exceed the OS
-    # ARG_MAX limit and FFmpeg reports "No such file or directory" on the
-    # -filter_complex argument itself.  Writing the filter to a temp file and
-    # using -filter_complex_script removes that limit entirely.
+    # Use -filter_complex_script instead of -filter_complex to avoid ARG_MAX.
+    # With 55 bursts the filter string is ~15 KB — far beyond what the OS
+    # allows as a single shell argument on some platforms (Heroku dynos, etc.).
     filter_file = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -166,7 +191,7 @@ def add_random_text_overlay(input_file: str, output_file: str, text: str) -> str
             [
                 "ffmpeg", "-y",
                 "-i", input_file,
-                "-filter_complex_script", filter_file,   # ← no ARG_MAX limit
+                "-filter_complex_script", filter_file,  # ← no ARG_MAX limit
                 "-map", "[out]",
                 "-map", "0:a?",       # pass audio through if present
                 "-c:v", "libx264",
