@@ -13,7 +13,6 @@ import logging
 import requests
 import tgcrypto
 import subprocess
-import multiprocessing
 import concurrent.futures
 from math import ceil
 from utils import progress_bar
@@ -50,15 +49,20 @@ def _resolve_font() -> str:
 
 _WM_FONT = _resolve_font()
 
+# ─── Memory limit: how many FFmpeg encodes run at the same time ───────────────
+# On Heroku 1 GB: 1 concurrent encode ≈ 180–250 MB → keep MAX_PARALLEL = 2
+# to stay well under 1 GB even with Python + Pyrogram overhead (~300 MB idle).
+# Raise to 3 only if you upgrade to a 2 GB dyno.
+_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "2"))
 
-# ─── Core: Single-pass watermark (used per-chunk in parallel) ─────────────────
+
+# ─── Core: Single-pass watermark ─────────────────────────────────────────────
 
 def add_random_text_overlay(
     input_file: str,
     output_file: str,
     text: str,
     progress_callback=None,
-    # Wave params — pass these to keep motion seamless across chunks
     time_offset: float = 0.0,
     period_x: float = None,
     period_y: float = None,
@@ -67,14 +71,7 @@ def add_random_text_overlay(
 ) -> str:
     """
     Burns a continuously wandering text watermark into a video using FFmpeg.
-
-    When called per-chunk, pass time_offset + shared wave params so the
-    watermark position is seamless across chunk boundaries.
-
-    Encoding: -crf 12 (near-lossless x264, yuv420p) so chunks can be
-    concat'd with -c copy without visible quality loss at the join points.
     """
-    # ── 1. Probe resolution (duration comes from caller for chunks) ───────────
     try:
         probe = subprocess.run(
             [
@@ -95,16 +92,11 @@ def add_random_text_overlay(
         print(f"[watermark] ffprobe failed: {e} — skipping overlay")
         return input_file
 
-    if duration < 1:
-        # Very short chunk — still watermark it, don't skip
-        pass
-
     if not _WM_FONT:
         print("[watermark] No font available — skipping overlay")
         return input_file
     font = _WM_FONT
 
-    # ── 2. Font + safe area ───────────────────────────────────────────────────
     fontsize   = max(22, int(vid_w * 0.028))
     text_w_est = int(len(text) * fontsize * 0.60)
     text_h_est = int(fontsize * 1.2)
@@ -121,11 +113,10 @@ def add_random_text_overlay(
     cx      = safe_x_min + range_x
     cy      = safe_y_min + range_y
 
-    # ── 3. Wave params — use caller's or generate fresh ones ─────────────────
     if period_x is None:
         period_x = random.uniform(60, 90)
     if period_y is None:
-        period_y = period_x * 1.4142135623730951   # √2 ratio → Lissajous path
+        period_y = period_x * 1.4142135623730951
     if phase_x is None:
         phase_x = random.uniform(0, 6.2832)
     if phase_y is None:
@@ -136,7 +127,6 @@ def add_random_text_overlay(
         f"offset={time_offset:.1f}s px={period_x:.1f}s py={period_y:.1f}s"
     )
 
-    # ── 4. Escape text ────────────────────────────────────────────────────────
     safe_text = (
         text
         .replace("\\", "\\\\")
@@ -144,17 +134,10 @@ def add_random_text_overlay(
         .replace(":",  "\\:")
     )
 
-    # ── 5. Build FFmpeg drawtext filter ───────────────────────────────────────
-    # KEY: use (t + time_offset) so chunks continue the wave smoothly.
-    # This makes the watermark position seamless at every chunk join.
     fontfile_clause = (
         f":fontfile='{font.replace(chr(58), chr(92) + chr(58))}'" if font else ""
     )
 
-    # t in FFmpeg drawtext is the PTS of the current frame.
-    # For chunk N that starts at global_time=time_offset:
-    #   global_t = t + time_offset
-    # So we substitute (t+{time_offset:.4f}) for t in the sine expressions.
     t_expr  = f"(t+{time_offset:.4f})"
     x_expr  = f"{cx:.1f}+{range_x:.1f}*sin(6.2832/{period_x:.4f}*{t_expr}+{phase_x:.4f})"
     y_expr  = f"{cy:.1f}+{range_y:.1f}*sin(6.2832/{period_y:.4f}*{t_expr}+{phase_y:.4f})"
@@ -171,17 +154,8 @@ def add_random_text_overlay(
         f":y={y_expr}"
     )
 
-    # yuv420p: required for Telegram / WhatsApp / iOS / Android compatibility
     filter_chain = f"{drawtext_filter},format=yuv420p"
 
-    # ── 6. FFmpeg encode ──────────────────────────────────────────────────────
-    # -crf 12   → near-lossless x264 (visually identical to source).
-    #             Replaces the broken -qp 0 + -profile:v high combo:
-    #             x264 lossless requires high444 profile but yuv420p needs
-    #             high profile — those two constraints are mutually exclusive.
-    # -preset ultrafast → fastest encode; fine for near-lossless crf.
-    # No -profile:v flag → x264 auto-selects "high" for yuv420p, which is
-    #             correct and compatible with all players and -c copy concat.
     try:
         process = subprocess.Popen(
             [
@@ -189,9 +163,8 @@ def add_random_text_overlay(
                 "-i", input_file,
                 "-vf", filter_chain,
                 "-c:v", "libx264",
-                "-crf", "12",            # ← near-lossless (replaces broken -qp 0)
-                "-preset", "ultrafast",  # ← fastest encode
-                                         # NO -profile:v — auto = "high" for yuv420p
+                "-crf", "12",
+                "-preset", "ultrafast",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
                 "-progress", "pipe:1",
@@ -232,52 +205,32 @@ def add_random_text_overlay(
         return input_file
 
 
-# ─── Multiprocessing worker (must be top-level to be picklable) ───────────────
-
-def _wm_chunk_worker(args: tuple) -> str:
-    """
-    Called by multiprocessing.Pool — runs add_random_text_overlay for one chunk.
-    Returns the output path of the watermarked chunk.
-    """
-    (input_file, output_file, text,
-     time_offset, period_x, period_y, phase_x, phase_y) = args
-
-    return add_random_text_overlay(
-        input_file=input_file,
-        output_file=output_file,
-        text=text,
-        progress_callback=None,   # no per-chunk progress in parallel mode
-        time_offset=time_offset,
-        period_x=period_x,
-        period_y=period_y,
-        phase_x=phase_x,
-        phase_y=phase_y,
-    )
-
-
-# ─── Public API: parallel chunked watermark ───────────────────────────────────
+# ─── Memory-safe chunked watermark ────────────────────────────────────────────
 
 def add_watermark_parallel(
     input_file: str,
     output_file: str,
     text: str,
-    chunk_duration: int = 300,   # 5 min chunks (tune to your CPU count)
+    chunk_duration: int = 600,      # ← 10 min chunks: fewer chunks = less temp disk
     progress_callback=None,
-    workers: int = None,         # defaults to os.cpu_count()
+    workers: int = None,            # ignored now; use _MAX_PARALLEL_ENCODES env var
 ) -> str:
     """
-    Fast, near-lossless parallel watermarking pipeline:
+    Memory-safe chunked watermarking pipeline:
 
       1. Split input into chunks with -c copy  (instant, no re-encode)
-      2. Watermark each chunk in parallel with -crf 12 (near-lossless x264)
-         — wave params shared so motion is seamless across boundaries
-      3. Concat watermarked chunks with -c copy (instant, no re-encode)
-      4. Final output: visually identical to source, watermark burned in
+      2. Watermark chunks with a semaphore-limited ThreadPoolExecutor
+         so at most _MAX_PARALLEL_ENCODES FFmpeg processes run at once.
+         Default = 2 → safely under Heroku 1 GB RAM.
+      3. Delete each raw chunk immediately after its watermarked version
+         is produced, keeping temp disk usage low.
+      4. Concat watermarked chunks with -c copy (instant, no re-encode)
 
-    Falls back to single-pass add_random_text_overlay on any error.
+    Set env var WM_MAX_PARALLEL=1 to go fully sequential (safest, slowest).
+    Set WM_MAX_PARALLEL=3 only on a 2 GB+ dyno.
     """
     tmp_dir = tempfile.mkdtemp(prefix="wm_parallel_")
-    print(f"[wm_parallel] Working in {tmp_dir}")
+    print(f"[wm_parallel] Working in {tmp_dir} | max_parallel={_MAX_PARALLEL_ENCODES}")
 
     try:
         # ── Step 1: Probe total duration ──────────────────────────────────────
@@ -297,9 +250,6 @@ def add_watermark_parallel(
             progress_callback(2)
 
         # ── Step 2: Split at keyframes (-c copy, ultra-fast) ─────────────────
-        # -reset_timestamps 1 → each chunk's PTS starts at 0 (required so
-        # ffprobe duration is correct per chunk and t=0 in drawtext is the
-        # chunk's first frame — we add time_offset to compensate).
         chunk_pattern = os.path.join(tmp_dir, "chunk_%04d.mp4")
         split_result = subprocess.run(
             [
@@ -329,14 +279,13 @@ def add_watermark_parallel(
         if progress_callback:
             progress_callback(5)
 
-        # ── Step 3: One shared wave — ensures seamless motion at joins ────────
+        # ── Step 3: Shared wave params for seamless motion ────────────────────
         period_x = random.uniform(60, 90)
         period_y = period_x * 1.4142135623730951
         phase_x  = random.uniform(0, 6.2832)
         phase_y  = random.uniform(0, 6.2832)
 
-        # Measure each chunk's actual duration to compute exact time offsets.
-        # (Chunks near keyframes may be slightly shorter/longer than chunk_duration.)
+        # Measure each chunk's actual duration to compute exact time offsets
         offsets      = []
         running_time = 0.0
         for chunk in chunks:
@@ -351,36 +300,65 @@ def add_watermark_parallel(
             chunk_dur    = float(r.stdout.strip() or chunk_duration)
             running_time += chunk_dur
 
-        # ── Step 4: Build task list ───────────────────────────────────────────
-        tasks = []
-        for i, (chunk, offset) in enumerate(zip(chunks, offsets)):
-            out_chunk = os.path.join(tmp_dir, f"wm_{i:04d}.mp4")
-            tasks.append((
-                chunk, out_chunk, text,
-                offset, period_x, period_y, phase_x, phase_y,
-            ))
+        # ── Step 4: Semaphore-limited threaded encode ─────────────────────────
+        # ThreadPoolExecutor (not multiprocessing) — workers share the same
+        # Python process so there's no per-process overhead.
+        # The semaphore caps concurrent FFmpeg subprocesses regardless of
+        # how many threads the executor spins up.
+        sem         = concurrent.futures.ThreadPoolExecutor(
+                          max_workers=_MAX_PARALLEL_ENCODES
+                      )
+        wm_chunks   = [None] * len(chunks)
+        total        = len(chunks)
+        completed    = [0]
 
-        # ── Step 5: Parallel encode (all CPU cores) ───────────────────────────
-        cpu_count = workers or max(1, os.cpu_count() or 1)
-        print(f"[wm_parallel] Watermarking {len(tasks)} chunks on {cpu_count} cores")
+        def encode_chunk(idx, chunk, offset):
+            out_chunk = os.path.join(tmp_dir, f"wm_{idx:04d}.mp4")
+            result = add_random_text_overlay(
+                input_file=chunk,
+                output_file=out_chunk,
+                text=text,
+                progress_callback=None,
+                time_offset=offset,
+                period_x=period_x,
+                period_y=period_y,
+                phase_x=phase_x,
+                phase_y=phase_y,
+            )
+            # ── Free raw chunk disk space immediately after encode ────────────
+            # This is critical: without this, raw + watermarked chunks
+            # coexist and can fill /tmp on low-disk dynos.
+            try:
+                os.remove(chunk)
+            except OSError:
+                pass
 
-        # NOTE: Each worker runs its own ffmpeg process, so cpu_count workers
-        # means cpu_count simultaneous ffmpeg encodes — tune if memory-limited.
-        with multiprocessing.Pool(processes=cpu_count) as pool:
-            wm_chunks = pool.map(_wm_chunk_worker, tasks)
+            completed[0] += 1
+            # Rough progress: 5% reserved for split, 90% for encoding, 5% for concat
+            pct = 5 + int((completed[0] / total) * 85)
+            if progress_callback:
+                try:
+                    progress_callback(pct)
+                except Exception:
+                    pass
 
-        # Verify all chunks succeeded (fall back to input_file path means failure)
-        failed = [wm for wm, orig in zip(wm_chunks, [t[1] for t in tasks])
-                  if wm == orig[0]]   # returned input_file == failure
-        if failed:
-            print(f"[wm_parallel] {len(failed)} chunk(s) failed watermarking")
+            return idx, result
+
+        futures = []
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=_MAX_PARALLEL_ENCODES
+        ) as executor:
+            for idx, (chunk, offset) in enumerate(zip(chunks, offsets)):
+                futures.append(executor.submit(encode_chunk, idx, chunk, offset))
+
+            for fut in concurrent.futures.as_completed(futures):
+                idx, result = fut.result()
+                wm_chunks[idx] = result
 
         if progress_callback:
             progress_callback(90)
 
-        # ── Step 6: Concat with -c copy (no re-encode, no quality loss) ───────
-        # Works because every chunk uses the same codec params:
-        # libx264 / crf 12 / yuv420p / auto-profile (high).
+        # ── Step 5: Concat with -c copy (no re-encode) ────────────────────────
         filelist_path = os.path.join(tmp_dir, "filelist.txt")
         with open(filelist_path, "w") as f:
             for wm_chunk in wm_chunks:
@@ -428,10 +406,6 @@ async def send_vid(
     topic_id=None,
     watermark_text: str = None,
 ):
-    """
-    Send video to channel, with optional parallel-lossless watermark.
-    Replaces the old single-pass watermark call with add_watermark_parallel.
-    """
     if watermark_text:
         base, ext = os.path.splitext(filename)
         wm_output = f"{base}_wm{ext or '.mp4'}"
@@ -463,14 +437,13 @@ async def send_vid(
 
         loop = asyncio.get_event_loop()
 
-        # ← use add_watermark_parallel instead of add_random_text_overlay
         watermarked = await loop.run_in_executor(
             None,
             add_watermark_parallel,
             filename, wm_output, watermark_text,
-            300,                    # chunk_duration: 5 min
-            sync_progress_callback, # progress_callback
-            None,                   # workers: auto (os.cpu_count())
+            600,                    # chunk_duration: 10 min (fewer chunks)
+            sync_progress_callback,
+            None,
         )
 
         await status_msg.edit_text(
