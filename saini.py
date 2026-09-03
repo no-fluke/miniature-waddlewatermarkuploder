@@ -163,7 +163,7 @@ def add_random_text_overlay(
                 "-i", input_file,
                 "-vf", filter_chain,
                 "-c:v", "libx264",
-                "-crf", "20",
+                "-crf", "23",
                 "-preset", "fast",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
