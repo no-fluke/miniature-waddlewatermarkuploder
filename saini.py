@@ -108,13 +108,13 @@ def add_random_text_overlay(
     safe_y_min = margin_y
     safe_y_max = max(margin_y + 1, vid_h - margin_y - text_h_est)
 
-    range_x = (safe_x_max - safe_x_min) / 2
-    range_y = (safe_y_max - safe_y_min) / 2
+    range_x = (safe_x_max - safe_x_min) / 20
+    range_y = (safe_y_max - safe_y_min) / 20
     cx      = safe_x_min + range_x
     cy      = safe_y_min + range_y
 
     if period_x is None:
-        period_x = random.uniform(180, 240)
+        period_x = random.uniform(300, 500)
     if period_y is None:
         period_y = period_x * 1.4142135623730951
     if phase_x is None:
@@ -280,7 +280,7 @@ def add_watermark_parallel(
             progress_callback(5)
 
         # ── Step 3: Shared wave params for seamless motion ────────────────────
-        period_x = random.uniform(90, 180)
+        period_x = random.uniform(200, 500)
         period_y = period_x * 1.4142135623730951
         phase_x  = random.uniform(0, 6.2832)
         phase_y  = random.uniform(0, 6.2832)
