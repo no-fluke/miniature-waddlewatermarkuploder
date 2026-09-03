@@ -163,7 +163,7 @@ def add_random_text_overlay(
                 "-i", input_file,
                 "-vf", filter_chain,
                 "-c:v", "libx264",
-                "-crf", "12",
+                "-crf", "23",
                 "-preset", "ultrafast",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
@@ -280,7 +280,7 @@ def add_watermark_parallel(
             progress_callback(5)
 
         # ── Step 3: Shared wave params for seamless motion ────────────────────
-        period_x = random.uniform(60, 90)
+        period_x = random.uniform(90, 180)
         period_y = period_x * 1.4142135623730951
         phase_x  = random.uniform(0, 6.2832)
         phase_y  = random.uniform(0, 6.2832)
