@@ -53,7 +53,7 @@ _WM_FONT = _resolve_font()
 # On Heroku 1 GB: 1 concurrent encode ≈ 180–250 MB → keep MAX_PARALLEL = 2
 # to stay well under 1 GB even with Python + Pyrogram overhead (~300 MB idle).
 # Raise to 3 only if you upgrade to a 2 GB dyno.
-_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "2"))
+_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "1"))
 
 
 # ─── Core: Single-pass watermark ─────────────────────────────────────────────
