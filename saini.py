@@ -97,7 +97,7 @@ def add_random_text_overlay(
         return input_file
     font = _WM_FONT
 
-    fontsize   = max(22, int(vid_w * 0.028))
+    fontsize   = 32
     text_w_est = int(len(text) * fontsize * 0.60)
     text_h_est = int(fontsize * 1.2)
 
