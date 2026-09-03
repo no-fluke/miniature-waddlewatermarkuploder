@@ -164,7 +164,7 @@ def add_random_text_overlay(
                 "-vf", filter_chain,
                 "-c:v", "libx264",
                 "-crf", "23",
-                "-preset", "ultrafast",
+                "-preset", "fast",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
                 "-progress", "pipe:1",
