@@ -108,13 +108,13 @@ def add_random_text_overlay(
     safe_y_min = margin_y
     safe_y_max = max(margin_y + 1, vid_h - margin_y - text_h_est)
 
-    range_x = (safe_x_max - safe_x_min) / 20
-    range_y = (safe_y_max - safe_y_min) / 20
+    range_x = (safe_x_max - safe_x_min) / 2
+    range_y = (safe_y_max - safe_y_min) / 2
     cx      = safe_x_min + range_x
     cy      = safe_y_min + range_y
 
     if period_x is None:
-        period_x = random.uniform(300, 500)
+        period_x = random.uniform(180, 240)
     if period_y is None:
         period_y = period_x * 1.4142135623730951
     if phase_x is None:
@@ -163,7 +163,7 @@ def add_random_text_overlay(
                 "-i", input_file,
                 "-vf", filter_chain,
                 "-c:v", "libx264",
-                "-crf", "23",
+                "-crf", "20",
                 "-preset", "fast",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
