@@ -114,7 +114,7 @@ def add_random_text_overlay(
     cy      = safe_y_min + range_y
 
     if period_x is None:
-        period_x = random.uniform(60, 90)
+        period_x = random.uniform(180, 240)
     if period_y is None:
         period_y = period_x * 1.4142135623730951
     if phase_x is None:
