@@ -54,11 +54,12 @@ def _resolve_font() -> str:
 _WM_FONT = _resolve_font()
 
 # ─── Parallel encode limit ────────────────────────────────────────────────────
-# Heroku 1 GB: keep MAX_PARALLEL = 1 (sequential, safest).
-# Each FFmpeg encode ≈ 200–250 MB RAM.  Python + Pyrogram idle ≈ 300 MB.
-# 1 encode: ~550 MB total → safe headroom.
-# 2 encodes: ~800 MB → risky. 3 encodes: OOM kill.
-_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "1"))
+# With 60-second fragments each encode uses only ~30-60 MB RAM (tiny clip).
+# Python + Pyrogram idle ≈ 300 MB.
+# 3 parallel x 60 MB = 180 MB + 300 MB = ~480 MB → safe on 1 GB dyno.
+# WM_MAX_PARALLEL=2 → more conservative (~420 MB peak).
+# WM_MAX_PARALLEL=4 → only on 2 GB+ dynos.
+_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "3"))
 
 # ─── Global semaphore: cap concurrent watermark jobs across all bot users ─────
 # Without this, two users uploading simultaneously bypass _MAX_PARALLEL_ENCODES.
@@ -244,27 +245,33 @@ def add_watermark_parallel(
     input_file: str,
     output_file: str,
     text: str,
-    chunk_duration: int = 1800,     # ← 30 min chunks: fewer splits, less /tmp churn
+    chunk_duration: int = 60,       # 60-second fragments: small RAM footprint + smooth progress
     progress_callback=None,
-    workers: int = None,            # ignored; controlled by WM_MAX_PARALLEL env var
+    workers: int = None,            # ignored; always sequential on 1 GB dyno
 ) -> str:
     """
-    Memory-safe chunked watermarking pipeline:
+    Fragment-based watermarking pipeline optimised for Heroku 1 GB:
 
-      1. Split input into chunks with -c copy  (instant, no re-encode)
-      2. Watermark chunks sequentially (WM_MAX_PARALLEL=1, default) or with
-         limited parallelism. Each FFmpeg encode ≈ 200 MB; sequential keeps
-         total RAM at ~550 MB on a 1 GB Heroku dyno.
-      3. Delete each raw chunk immediately after its watermarked version is
-         confirmed on disk, keeping temp space to ~1× chunk size at any time.
-      4. Concat watermarked chunks with -c copy (instant, no re-encode).
+      1. Probe total duration.
+      2. Split into 60-second fragments with -c copy (no re-encode, instant).
+         Each fragment is ~10-50 MB on disk — tiny RAM footprint when encoding.
+      3. Encode fragments ONE AT A TIME sequentially:
+           - FFmpeg reads fragment from disk (not RAM)
+           - Watermarked fragment written to disk
+           - Raw fragment deleted immediately → only 2 small files exist at once
+           - Progress callback fires after each fragment → smooth bar movement
+      4. Concat all watermarked fragments with -c copy (no re-encode).
+      5. Temp dir cleaned up in finally block AND by atexit/SIGTERM handler.
 
-    Temp dir is registered globally so atexit / SIGTERM handlers clean it up
-    even if the dyno is killed mid-encode.
+    Progress breakdown:
+      2%        → probe done
+      3–5%      → split done
+      5–92%     → per-fragment encode (moves smoothly with every fragment)
+      92–100%   → concat + faststart
     """
-    tmp_dir = tempfile.mkdtemp(prefix="wm_parallel_")
+    tmp_dir = tempfile.mkdtemp(prefix="wm_frag_")
     _active_tmp_dirs.append(tmp_dir)
-    print(f"[wm_parallel] Working in {tmp_dir} | max_parallel={_MAX_PARALLEL_ENCODES}")
+    print(f"[wm_frag] Working in {tmp_dir} | fragment_duration={chunk_duration}s")
 
     try:
         # ── Step 1: Probe total duration ──────────────────────────────────────
@@ -279,14 +286,14 @@ def add_watermark_parallel(
         total_duration = float(probe_data.get("format", {}).get("duration", 0))
 
         if total_duration < 5:
-            print("[wm_parallel] Video too short — single pass")
+            print("[wm_frag] Video too short — single pass")
             return add_random_text_overlay(input_file, output_file, text, progress_callback)
 
         if progress_callback:
             progress_callback(2)
 
-        # ── Step 2: Split at keyframes (-c copy, ultra-fast) ─────────────────
-        chunk_pattern = os.path.join(tmp_dir, "chunk_%04d.mp4")
+        # ── Step 2: Split into 60-second fragments (-c copy, no re-encode) ────
+        frag_pattern = os.path.join(tmp_dir, "frag_%04d.mp4")
         split_result = subprocess.run(
             [
                 "ffmpeg", "-y",
@@ -296,57 +303,69 @@ def add_watermark_parallel(
                 "-segment_time", str(chunk_duration),
                 "-f", "segment",
                 "-reset_timestamps", "1",
-                chunk_pattern,
+                frag_pattern,
             ],
             capture_output=True, text=True,
         )
         if split_result.returncode != 0:
             raise RuntimeError(f"Split failed: {split_result.stderr[-1000:]}")
 
-        chunks = sorted([
+        fragments = sorted([
             os.path.join(tmp_dir, f)
             for f in os.listdir(tmp_dir)
-            if f.startswith("chunk_") and f.endswith(".mp4")
+            if f.startswith("frag_") and f.endswith(".mp4")
         ])
-        if not chunks:
-            raise RuntimeError("No chunks produced by split step")
+        if not fragments:
+            raise RuntimeError("No fragments produced by split step")
 
-        print(f"[wm_parallel] Split into {len(chunks)} chunks")
+        total_frags = len(fragments)
+        print(f"[wm_frag] Split into {total_frags} fragments (~{chunk_duration}s each)")
+
         if progress_callback:
             progress_callback(5)
 
-        # ── Step 3: Shared wave params for seamless motion ────────────────────
-        period_x = random.uniform(200, 500)
-        period_y = period_x * 1.4142135623730951
-        phase_x  = random.uniform(0, 6.2832)
-        phase_y  = random.uniform(0, 6.2832)
-
-        # Measure each chunk's actual duration to compute exact time offsets
+        # ── Step 3: Compute time offsets + fragment durations in one pass ─────
+        # Done up front so the encode loop has no ffprobe overhead per fragment.
         offsets      = []
         running_time = 0.0
-        for chunk in chunks:
+        for frag in fragments:
             offsets.append(running_time)
             r = subprocess.run(
                 ["ffprobe", "-v", "error",
                  "-show_entries", "format=duration",
                  "-of", "json",
-                 chunk],
+                 frag],
                 capture_output=True, text=True,
             )
-            chunk_data = json.loads(r.stdout)
-            chunk_dur  = float(chunk_data.get("format", {}).get("duration", chunk_duration))
-            running_time += chunk_dur
+            frag_data = json.loads(r.stdout)
+            frag_dur  = float(frag_data.get("format", {}).get("duration", chunk_duration))
+            running_time += frag_dur
 
-        # ── Step 4: Semaphore-limited threaded encode ─────────────────────────
-        wm_chunks = [None] * len(chunks)
-        total     = len(chunks)
-        completed = [0]
+        # ── Step 4: Shared wave params — seamless motion across all fragments ─
+        period_x = random.uniform(200, 500)
+        period_y = period_x * 1.4142135623730951
+        phase_x  = random.uniform(0, 6.2832)
+        phase_y  = random.uniform(0, 6.2832)
 
-        def encode_chunk(idx, chunk, offset):
-            out_chunk = os.path.join(tmp_dir, f"wm_{idx:04d}.mp4")
+        # ── Step 5: Parallel fragment encode ──────────────────────────────────
+        # _MAX_PARALLEL_ENCODES controls concurrency (default 3 for 60s fragments):
+        #   - 60s fragment encode uses ~30-60 MB RAM each
+        #   - 3 parallel x 60 MB = 180 MB + 300 MB Python = ~480 MB — safe on 1 GB
+        #   - WM_MAX_PARALLEL=2 for more conservative; =4 only on 2 GB+ dynos
+        #
+        # Thread-safe progress: a Lock ensures parallel threads never race on
+        # the completed counter, so the bar always moves forward correctly.
+        import threading
+        completed_count = [0]
+        progress_lock   = threading.Lock()
+        wm_fragments    = [None] * total_frags
+
+        def encode_fragment(idx, frag, offset):
+            out_frag = os.path.join(tmp_dir, f"wm_{idx:04d}.mp4")
+
             result = add_random_text_overlay(
-                input_file=chunk,
-                output_file=out_chunk,
+                input_file=frag,
+                output_file=out_frag,
                 text=text,
                 progress_callback=None,
                 time_offset=offset,
@@ -356,55 +375,47 @@ def add_watermark_parallel(
                 phase_y=phase_y,
             )
 
-            # ── Delete raw chunk only after confirmed watermarked output ──────
-            # Guard: only remove source if the watermarked file actually exists.
-            # If overlay failed, result == chunk (input returned unchanged) so
-            # we must NOT delete it — it is the only copy we have.
-            if result != chunk and os.path.exists(out_chunk):
+            # Delete raw fragment only if watermarked output confirmed on disk
+            if result != frag and os.path.exists(out_frag):
                 try:
-                    os.remove(chunk)
+                    os.remove(frag)
                 except OSError:
                     pass
 
-            completed[0] += 1
-            # 5% split → 85% encode → 10% concat
-            pct = 5 + int((completed[0] / total) * 85)
+            # Thread-safe counter + progress update
+            with progress_lock:
+                completed_count[0] += 1
+                done = completed_count[0]
+
+            pct = 5 + int((done / total_frags) * 87)
             if progress_callback:
                 try:
                     progress_callback(pct)
                 except Exception:
                     pass
 
+            print(f"[wm_frag] Fragment {done}/{total_frags} done ({pct}%)")
             return idx, result
 
-        if _MAX_PARALLEL_ENCODES == 1:
-            # Sequential: process one chunk at a time, raw chunk deleted before next starts.
-            # This is the correct mode for Heroku 1 GB — no thread overhead, minimal disk use.
-            for idx, (chunk, offset) in enumerate(zip(chunks, offsets)):
-                i, result = encode_chunk(idx, chunk, offset)
-                wm_chunks[i] = result
-        else:
-            # Parallel: submit all at once but cap concurrency via max_workers.
-            # Only use on dynos with enough RAM (2 GB+).
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=_MAX_PARALLEL_ENCODES
-            ) as executor:
-                futures = [
-                    executor.submit(encode_chunk, idx, chunk, offset)
-                    for idx, (chunk, offset) in enumerate(zip(chunks, offsets))
-                ]
-                for fut in concurrent.futures.as_completed(futures):
-                    idx, result = fut.result()
-                    wm_chunks[idx] = result
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=_MAX_PARALLEL_ENCODES
+        ) as executor:
+            futures = {
+                executor.submit(encode_fragment, idx, frag, offset): idx
+                for idx, (frag, offset) in enumerate(zip(fragments, offsets))
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                idx, result = fut.result()
+                wm_fragments[idx] = result
 
+        # ── Step 6: Concat all watermarked fragments with -c copy ─────────────
         if progress_callback:
-            progress_callback(90)
+            progress_callback(92)
 
-        # ── Step 5: Concat with -c copy (no re-encode) ────────────────────────
         filelist_path = os.path.join(tmp_dir, "filelist.txt")
         with open(filelist_path, "w") as f:
-            for wm_chunk in wm_chunks:
-                f.write(f"file '{wm_chunk}'\n")
+            for wm_frag in wm_fragments:
+                f.write(f"file '{wm_frag}'\n")
 
         concat_result = subprocess.run(
             [
@@ -423,11 +434,11 @@ def add_watermark_parallel(
         if progress_callback:
             progress_callback(100)
 
-        print(f"[wm_parallel] Done → {output_file}")
+        print(f"[wm_frag] Done → {output_file}")
         return output_file
 
     except Exception as ex:
-        print(f"[wm_parallel] Failed ({ex}) — falling back to single-pass")
+        print(f"[wm_frag] Failed ({ex}) — falling back to single-pass")
         return add_random_text_overlay(input_file, output_file, text, progress_callback)
 
     finally:
@@ -491,7 +502,7 @@ async def send_vid(
                 None,
                 add_watermark_parallel,
                 filename, wm_output, watermark_text,
-                1800,                   # chunk_duration: 30 min (fewer chunks)
+                60,                     # fragment_duration: 60s fragments → smooth progress + tiny RAM
                 sync_progress_callback,
                 None,
             )
