@@ -2,6 +2,7 @@ import os
 import re
 import time
 import mmap
+import json
 import random
 import tempfile
 import shutil
@@ -14,6 +15,8 @@ import requests
 import tgcrypto
 import subprocess
 import concurrent.futures
+import atexit
+import signal
 from math import ceil
 from utils import progress_bar
 from pyrogram import Client, filters
@@ -23,6 +26,7 @@ from pathlib import Path
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 from base64 import b64decode
+from typing import Optional
 
 # ─── Font Resolution ──────────────────────────────────────────────────────────
 
@@ -49,11 +53,37 @@ def _resolve_font() -> str:
 
 _WM_FONT = _resolve_font()
 
-# ─── Memory limit: how many FFmpeg encodes run at the same time ───────────────
-# On Heroku 1 GB: 1 concurrent encode ≈ 180–250 MB → keep MAX_PARALLEL = 2
-# to stay well under 1 GB even with Python + Pyrogram overhead (~300 MB idle).
-# Raise to 3 only if you upgrade to a 2 GB dyno.
-_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "2"))
+# ─── Parallel encode limit ────────────────────────────────────────────────────
+# Heroku 1 GB: keep MAX_PARALLEL = 1 (sequential, safest).
+# Each FFmpeg encode ≈ 200–250 MB RAM.  Python + Pyrogram idle ≈ 300 MB.
+# 1 encode: ~550 MB total → safe headroom.
+# 2 encodes: ~800 MB → risky. 3 encodes: OOM kill.
+_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "1"))
+
+# ─── Global semaphore: cap concurrent watermark jobs across all bot users ─────
+# Without this, two users uploading simultaneously bypass _MAX_PARALLEL_ENCODES.
+_WM_SEMAPHORE = None  # type: Optional[asyncio.Semaphore]
+
+def _get_wm_semaphore() -> asyncio.Semaphore:
+    """Lazy-init so we always get the running loop's semaphore."""
+    global _WM_SEMAPHORE
+    if _WM_SEMAPHORE is None:
+        _WM_SEMAPHORE = asyncio.Semaphore(1)
+    return _WM_SEMAPHORE
+
+# ─── Temp-dir registry: survive crashes and Heroku SIGTERM ───────────────────
+_active_tmp_dirs: list[str] = []
+
+def _cleanup_all_tmp():
+    for d in list(_active_tmp_dirs):
+        shutil.rmtree(d, ignore_errors=True)
+
+def _sigterm_handler(*_):
+    _cleanup_all_tmp()
+    os._exit(0)
+
+atexit.register(_cleanup_all_tmp)
+signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 # ─── Core: Single-pass watermark ─────────────────────────────────────────────
@@ -71,6 +101,7 @@ def add_random_text_overlay(
 ) -> str:
     """
     Burns a continuously wandering text watermark into a video using FFmpeg.
+    Uses ffprobe JSON output for reliable dimension/duration parsing.
     """
     try:
         probe = subprocess.run(
@@ -79,15 +110,17 @@ def add_random_text_overlay(
                 "-select_streams", "v:0",
                 "-show_entries", "stream=width,height",
                 "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-of", "json",
                 input_file,
             ],
             capture_output=True, text=True, timeout=30,
         )
-        lines = [l.strip() for l in probe.stdout.strip().splitlines() if l.strip()]
-        vid_w    = int(lines[0])   if len(lines) > 0 else 1280
-        vid_h    = int(lines[1])   if len(lines) > 1 else 720
-        duration = float(lines[2]) if len(lines) > 2 else 0.0
+        data     = json.loads(probe.stdout)
+        streams  = data.get("streams", [{}])
+        fmt      = data.get("format", {})
+        vid_w    = int(streams[0].get("width",    1280))
+        vid_h    = int(streams[0].get("height",   720))
+        duration = float(fmt.get("duration",      0.0))
     except Exception as e:
         print(f"[watermark] ffprobe failed: {e} — skipping overlay")
         return input_file
@@ -211,25 +244,26 @@ def add_watermark_parallel(
     input_file: str,
     output_file: str,
     text: str,
-    chunk_duration: int = 600,      # ← 10 min chunks: fewer chunks = less temp disk
+    chunk_duration: int = 1800,     # ← 30 min chunks: fewer splits, less /tmp churn
     progress_callback=None,
-    workers: int = None,            # ignored now; use _MAX_PARALLEL_ENCODES env var
+    workers: int = None,            # ignored; controlled by WM_MAX_PARALLEL env var
 ) -> str:
     """
     Memory-safe chunked watermarking pipeline:
 
       1. Split input into chunks with -c copy  (instant, no re-encode)
-      2. Watermark chunks with a semaphore-limited ThreadPoolExecutor
-         so at most _MAX_PARALLEL_ENCODES FFmpeg processes run at once.
-         Default = 2 → safely under Heroku 1 GB RAM.
-      3. Delete each raw chunk immediately after its watermarked version
-         is produced, keeping temp disk usage low.
-      4. Concat watermarked chunks with -c copy (instant, no re-encode)
+      2. Watermark chunks sequentially (WM_MAX_PARALLEL=1, default) or with
+         limited parallelism. Each FFmpeg encode ≈ 200 MB; sequential keeps
+         total RAM at ~550 MB on a 1 GB Heroku dyno.
+      3. Delete each raw chunk immediately after its watermarked version is
+         confirmed on disk, keeping temp space to ~1× chunk size at any time.
+      4. Concat watermarked chunks with -c copy (instant, no re-encode).
 
-    Set env var WM_MAX_PARALLEL=1 to go fully sequential (safest, slowest).
-    Set WM_MAX_PARALLEL=3 only on a 2 GB+ dyno.
+    Temp dir is registered globally so atexit / SIGTERM handlers clean it up
+    even if the dyno is killed mid-encode.
     """
     tmp_dir = tempfile.mkdtemp(prefix="wm_parallel_")
+    _active_tmp_dirs.append(tmp_dir)
     print(f"[wm_parallel] Working in {tmp_dir} | max_parallel={_MAX_PARALLEL_ENCODES}")
 
     try:
@@ -237,11 +271,13 @@ def add_watermark_parallel(
         probe = subprocess.run(
             ["ffprobe", "-v", "error",
              "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1",
+             "-of", "json",
              input_file],
             capture_output=True, text=True, timeout=30,
         )
-        total_duration = float(probe.stdout.strip() or 0)
+        probe_data     = json.loads(probe.stdout)
+        total_duration = float(probe_data.get("format", {}).get("duration", 0))
+
         if total_duration < 5:
             print("[wm_parallel] Video too short — single pass")
             return add_random_text_overlay(input_file, output_file, text, progress_callback)
@@ -293,24 +329,18 @@ def add_watermark_parallel(
             r = subprocess.run(
                 ["ffprobe", "-v", "error",
                  "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 "-of", "json",
                  chunk],
                 capture_output=True, text=True,
             )
-            chunk_dur    = float(r.stdout.strip() or chunk_duration)
+            chunk_data = json.loads(r.stdout)
+            chunk_dur  = float(chunk_data.get("format", {}).get("duration", chunk_duration))
             running_time += chunk_dur
 
         # ── Step 4: Semaphore-limited threaded encode ─────────────────────────
-        # ThreadPoolExecutor (not multiprocessing) — workers share the same
-        # Python process so there's no per-process overhead.
-        # The semaphore caps concurrent FFmpeg subprocesses regardless of
-        # how many threads the executor spins up.
-        sem         = concurrent.futures.ThreadPoolExecutor(
-                          max_workers=_MAX_PARALLEL_ENCODES
-                      )
-        wm_chunks   = [None] * len(chunks)
-        total        = len(chunks)
-        completed    = [0]
+        wm_chunks = [None] * len(chunks)
+        total     = len(chunks)
+        completed = [0]
 
         def encode_chunk(idx, chunk, offset):
             out_chunk = os.path.join(tmp_dir, f"wm_{idx:04d}.mp4")
@@ -325,16 +355,19 @@ def add_watermark_parallel(
                 phase_x=phase_x,
                 phase_y=phase_y,
             )
-            # ── Free raw chunk disk space immediately after encode ────────────
-            # This is critical: without this, raw + watermarked chunks
-            # coexist and can fill /tmp on low-disk dynos.
-            try:
-                os.remove(chunk)
-            except OSError:
-                pass
+
+            # ── Delete raw chunk only after confirmed watermarked output ──────
+            # Guard: only remove source if the watermarked file actually exists.
+            # If overlay failed, result == chunk (input returned unchanged) so
+            # we must NOT delete it — it is the only copy we have.
+            if result != chunk and os.path.exists(out_chunk):
+                try:
+                    os.remove(chunk)
+                except OSError:
+                    pass
 
             completed[0] += 1
-            # Rough progress: 5% reserved for split, 90% for encoding, 5% for concat
+            # 5% split → 85% encode → 10% concat
             pct = 5 + int((completed[0] / total) * 85)
             if progress_callback:
                 try:
@@ -344,16 +377,25 @@ def add_watermark_parallel(
 
             return idx, result
 
-        futures = []
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=_MAX_PARALLEL_ENCODES
-        ) as executor:
+        if _MAX_PARALLEL_ENCODES == 1:
+            # Sequential: process one chunk at a time, raw chunk deleted before next starts.
+            # This is the correct mode for Heroku 1 GB — no thread overhead, minimal disk use.
             for idx, (chunk, offset) in enumerate(zip(chunks, offsets)):
-                futures.append(executor.submit(encode_chunk, idx, chunk, offset))
-
-            for fut in concurrent.futures.as_completed(futures):
-                idx, result = fut.result()
-                wm_chunks[idx] = result
+                i, result = encode_chunk(idx, chunk, offset)
+                wm_chunks[i] = result
+        else:
+            # Parallel: submit all at once but cap concurrency via max_workers.
+            # Only use on dynos with enough RAM (2 GB+).
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=_MAX_PARALLEL_ENCODES
+            ) as executor:
+                futures = [
+                    executor.submit(encode_chunk, idx, chunk, offset)
+                    for idx, (chunk, offset) in enumerate(zip(chunks, offsets))
+                ]
+                for fut in concurrent.futures.as_completed(futures):
+                    idx, result = fut.result()
+                    wm_chunks[idx] = result
 
         if progress_callback:
             progress_callback(90)
@@ -390,6 +432,10 @@ def add_watermark_parallel(
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        try:
+            _active_tmp_dirs.remove(tmp_dir)
+        except ValueError:
+            pass
 
 
 # ─── send_vid integration ─────────────────────────────────────────────────────
@@ -437,14 +483,18 @@ async def send_vid(
 
         loop = asyncio.get_event_loop()
 
-        watermarked = await loop.run_in_executor(
-            None,
-            add_watermark_parallel,
-            filename, wm_output, watermark_text,
-            600,                    # chunk_duration: 10 min (fewer chunks)
-            sync_progress_callback,
-            None,
-        )
+        # ── Global semaphore: only 1 watermark job runs at a time bot-wide ───
+        # This prevents two simultaneous uploads from spawning two FFmpeg
+        # processes in parallel, defeating _MAX_PARALLEL_ENCODES entirely.
+        async with _get_wm_semaphore():
+            watermarked = await loop.run_in_executor(
+                None,
+                add_watermark_parallel,
+                filename, wm_output, watermark_text,
+                1800,                   # chunk_duration: 30 min (fewer chunks)
+                sync_progress_callback,
+                None,
+            )
 
         await status_msg.edit_text(
             f"🖊️ **Watermark Done ✅**\n"
@@ -600,6 +650,7 @@ async def aio(url, name):
     return k
 
 async def download(url, name):
+    """Stream download to disk — never buffers the full file in RAM."""
     MIME_TO_EXT = {
         'video/mp4':        'mp4',
         'video/x-matroska': 'mkv',
@@ -621,9 +672,11 @@ async def download(url, name):
                     _, url_ext = os.path.splitext(path)
                     ext = url_ext.lstrip('.') if url_ext else 'pdf'
                 ka = f'{name}.{ext}'
-                f  = await aiofiles.open(ka, mode='wb')
-                await f.write(await resp.read())
-                await f.close()
+                # ── Stream in 256 KB chunks — never loads full file into RAM ──
+                async with aiofiles.open(ka, mode='wb') as f:
+                    async for chunk in resp.content.iter_chunked(256 * 1024):
+                        if chunk:
+                            await f.write(chunk)
     return ka
 
 async def pdf_download(url, file_name, chunk_size=1024 * 10):
