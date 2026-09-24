@@ -59,7 +59,7 @@ _WM_FONT = _resolve_font()
 # 3 parallel x 60 MB = 180 MB + 300 MB = ~480 MB → safe on 1 GB dyno.
 # WM_MAX_PARALLEL=2 → more conservative (~420 MB peak).
 # WM_MAX_PARALLEL=4 → only on 2 GB+ dynos.
-_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "3"))
+_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "2"))
 
 # ─── Global semaphore: cap concurrent watermark jobs across all bot users ─────
 # Without this, two users uploading simultaneously bypass _MAX_PARALLEL_ENCODES.
