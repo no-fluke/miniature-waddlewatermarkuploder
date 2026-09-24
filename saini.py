@@ -54,7 +54,7 @@ def _resolve_font() -> str:
 _WM_FONT = _resolve_font()
 
 # ─── Parallel encode limit ────────────────────────────────────────────────────
-_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "4"))
+_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "2"))
 
 # ─── Global semaphore ─────────────────────────────────────────────────────────
 _WM_SEMAPHORE: Optional[asyncio.Semaphore] = None
@@ -335,7 +335,7 @@ def add_watermark_parallel(
     input_file: str,
     output_file: str,
     text: str,
-    chunk_duration: int = 15,
+    chunk_duration: int = 60,
     progress_callback=None,
     workers: int = None,
 ) -> str:
@@ -608,7 +608,7 @@ async def send_vid(
                 None,
                 add_watermark_parallel,
                 filename, wm_output, watermark_text,
-                15,
+                60,
                 sync_progress_callback,
                 None,
             )
