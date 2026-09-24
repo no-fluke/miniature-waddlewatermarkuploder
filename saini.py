@@ -608,7 +608,7 @@ async def send_vid(
                 None,
                 add_watermark_parallel,
                 filename, wm_output, watermark_text,
-                60,
+                15,
                 sync_progress_callback,
                 None,
             )
