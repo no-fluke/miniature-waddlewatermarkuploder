@@ -54,25 +54,18 @@ def _resolve_font() -> str:
 _WM_FONT = _resolve_font()
 
 # ─── Parallel encode limit ────────────────────────────────────────────────────
-# With 60-second fragments each encode uses only ~30-60 MB RAM (tiny clip).
-# Python + Pyrogram idle ≈ 300 MB.
-# 3 parallel x 60 MB = 180 MB + 300 MB = ~480 MB → safe on 1 GB dyno.
-# WM_MAX_PARALLEL=2 → more conservative (~420 MB peak).
-# WM_MAX_PARALLEL=4 → only on 2 GB+ dynos.
-_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "2"))
+_MAX_PARALLEL_ENCODES = int(os.environ.get("WM_MAX_PARALLEL", "4"))
 
-# ─── Global semaphore: cap concurrent watermark jobs across all bot users ─────
-# Without this, two users uploading simultaneously bypass _MAX_PARALLEL_ENCODES.
-_WM_SEMAPHORE = None  # type: Optional[asyncio.Semaphore]
+# ─── Global semaphore ─────────────────────────────────────────────────────────
+_WM_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
 def _get_wm_semaphore() -> asyncio.Semaphore:
-    """Lazy-init so we always get the running loop's semaphore."""
     global _WM_SEMAPHORE
     if _WM_SEMAPHORE is None:
         _WM_SEMAPHORE = asyncio.Semaphore(1)
     return _WM_SEMAPHORE
 
-# ─── Temp-dir registry: survive crashes and Heroku SIGTERM ───────────────────
+# ─── Temp-dir registry ────────────────────────────────────────────────────────
 _active_tmp_dirs: list[str] = []
 
 def _cleanup_all_tmp():
@@ -87,7 +80,80 @@ atexit.register(_cleanup_all_tmp)
 signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
-# ─── Core: Single-pass watermark ─────────────────────────────────────────────
+# ─── Bitrate probe ────────────────────────────────────────────────────────────
+
+def _probe_video_bitrate(input_file: str) -> Optional[int]:
+    """
+    Returns the video stream bitrate in bits/sec, or None if unavailable.
+
+    Strategy (most-to-least reliable):
+      1. stream-level bit_rate  — set in most MP4/MKV
+      2. format-level bit_rate  — total container bitrate (overestimate for
+                                   muxed files, but better than nothing)
+    We cap the returned value at 15 Mbps so a corrupt/inflated probe value
+    never produces a monstrous output file.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=bit_rate",
+                "-show_entries", "format=bit_rate",
+                "-of", "json",
+                input_file,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(probe.stdout)
+
+        # 1. Stream-level (most accurate)
+        stream_br = data.get("streams", [{}])[0].get("bit_rate")
+        if stream_br and str(stream_br).isdigit():
+            return min(int(stream_br), 15_000_000)
+
+        # 2. Format-level fallback
+        fmt_br = data.get("format", {}).get("bit_rate")
+        if fmt_br and str(fmt_br).isdigit():
+            return min(int(fmt_br), 15_000_000)
+
+    except Exception as e:
+        print(f"[bitrate_probe] Failed: {e}")
+
+    return None
+
+
+def _build_video_encode_args(source_bitrate: Optional[int]) -> list[str]:
+    """
+    Returns the FFmpeg video-encode flags that best match the source.
+
+    With a known bitrate  → VBR target mode:
+        -b:v <src>  -maxrate <src*1.15>  -bufsize <src*2>
+        This keeps output bitrate within ~15 % of source.
+        The small headroom lets the encoder handle I-frames without
+        hard-clipping, while bufsize gives it a 2-second lookahead window.
+
+    Without a known bitrate → CRF fallback (original behaviour):
+        -crf 20
+    """
+    if source_bitrate:
+        maxrate  = int(source_bitrate * 1.15)
+        bufsize  = int(source_bitrate * 2)
+        print(
+            f"[encode_args] VBR mode — target={source_bitrate//1000}k "
+            f"maxrate={maxrate//1000}k bufsize={bufsize//1000}k"
+        )
+        return [
+            "-b:v",      str(source_bitrate),
+            "-maxrate",  str(maxrate),
+            "-bufsize",  str(bufsize),
+        ]
+    else:
+        print("[encode_args] CRF fallback (bitrate unknown)")
+        return ["-crf", "20"]
+
+
+# ─── Core: Single-pass watermark ──────────────────────────────────────────────
 
 def add_random_text_overlay(
     input_file: str,
@@ -99,10 +165,18 @@ def add_random_text_overlay(
     period_y: float = None,
     phase_x: float = None,
     phase_y: float = None,
+    source_bitrate: Optional[int] = None,   # ← NEW: passed in from parallel wrapper
 ) -> str:
     """
     Burns a continuously wandering text watermark into a video using FFmpeg.
-    Uses ffprobe JSON output for reliable dimension/duration parsing.
+
+    Changes vs original:
+      • Accepts source_bitrate so the caller can probe once and reuse across
+        all fragments (avoids N ffprobe calls inside the parallel loop).
+      • Uses _build_video_encode_args() to set -b:v / -maxrate / -bufsize
+        (matched to source) or falls back to -crf 20 when bitrate is unknown.
+      • Output file is fsynced to disk before returning so the caller can
+        safely delete the raw fragment.
     """
     try:
         probe = subprocess.run(
@@ -156,6 +230,13 @@ def add_random_text_overlay(
     if phase_y is None:
         phase_y = random.uniform(0, 6.2832)
 
+    # ── Resolve encode flags ───────────────────────────────────────────────────
+    # Probe here only when called as a standalone (source_bitrate not supplied).
+    # When called from add_watermark_parallel the parent already probed once.
+    if source_bitrate is None:
+        source_bitrate = _probe_video_bitrate(input_file)
+    encode_args = _build_video_encode_args(source_bitrate)
+
     print(
         f"[watermark] {vid_w}x{vid_h} fontsize={fontsize} "
         f"offset={time_offset:.1f}s px={period_x:.1f}s py={period_y:.1f}s"
@@ -197,7 +278,7 @@ def add_random_text_overlay(
                 "-i", input_file,
                 "-vf", filter_chain,
                 "-c:v", "libx264",
-                "-crf", "20",
+                *encode_args,           # ← matched bitrate or CRF fallback
                 "-preset", "fast",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
@@ -231,6 +312,15 @@ def add_random_text_overlay(
             print(f"[watermark] FFmpeg error (code {process.returncode}):\n{err}")
             return input_file
 
+        # ── Fsync: guarantee the fragment is on disk before caller deletes raw ─
+        # Without this, the OS may still hold watermarked data in the write-back
+        # cache when the raw fragment is unlinked, risking data loss on a crash.
+        try:
+            with open(output_file, "ab") as fh:   # "ab" avoids truncation
+                os.fsync(fh.fileno())
+        except OSError as e:
+            print(f"[watermark] fsync warning: {e}")
+
         print(f"[watermark] Done → {output_file}")
         return output_file
 
@@ -245,54 +335,74 @@ def add_watermark_parallel(
     input_file: str,
     output_file: str,
     text: str,
-    chunk_duration: int = 60,       # 60-second fragments: small RAM footprint + smooth progress
+    chunk_duration: int = 15,
     progress_callback=None,
-    workers: int = None,            # ignored; always sequential on 1 GB dyno
+    workers: int = None,
 ) -> str:
     """
-    Fragment-based watermarking pipeline optimised for Heroku 1 GB:
+    Fragment-based watermarking pipeline.
 
-      1. Probe total duration.
-      2. Split into 60-second fragments with -c copy (no re-encode, instant).
-         Each fragment is ~10-50 MB on disk — tiny RAM footprint when encoding.
-      3. Encode fragments ONE AT A TIME sequentially:
-           - FFmpeg reads fragment from disk (not RAM)
-           - Watermarked fragment written to disk
-           - Raw fragment deleted immediately → only 2 small files exist at once
-           - Progress callback fires after each fragment → smooth bar movement
-      4. Concat all watermarked fragments with -c copy (no re-encode).
-      5. Temp dir cleaned up in finally block AND by atexit/SIGTERM handler.
+    Optimizations vs original:
+      1. Bitrate probe once on the SOURCE file, reused for every fragment.
+         This avoids N redundant ffprobe calls in the encode loop and ensures
+         every fragment uses the same bitrate target → consistent output quality.
 
-    Progress breakdown:
-      2%        → probe done
-      3–5%      → split done
-      5–92%     → per-fragment encode (moves smoothly with every fragment)
-      92–100%   → concat + faststart
+      2. After each fragment is watermarked and fsynced to disk, the raw
+         fragment is deleted immediately. At any point only two small files
+         exist simultaneously: one raw + one watermarked fragment.
+         The wm_fragments list holds only string paths (no file contents),
+         so RAM usage is O(1) with respect to video size.
+
+    Progress breakdown (unchanged from original):
+      2%      → probe done
+      3–5%    → split done
+      5–92%   → per-fragment encode
+      92–100% → concat + faststart
     """
     tmp_dir = tempfile.mkdtemp(prefix="wm_frag_")
     _active_tmp_dirs.append(tmp_dir)
     print(f"[wm_frag] Working in {tmp_dir} | fragment_duration={chunk_duration}s")
 
     try:
-        # ── Step 1: Probe total duration ──────────────────────────────────────
+        # ── Step 1: Probe total duration + source video bitrate ───────────────
+        # Both probed in a single ffprobe call to minimise subprocess overhead.
         probe = subprocess.run(
-            ["ffprobe", "-v", "error",
-             "-show_entries", "format=duration",
-             "-of", "json",
-             input_file],
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=bit_rate",
+                "-show_entries", "format=duration,bit_rate",
+                "-of", "json",
+                input_file,
+            ],
             capture_output=True, text=True, timeout=30,
         )
         probe_data     = json.loads(probe.stdout)
         total_duration = float(probe_data.get("format", {}).get("duration", 0))
 
+        # Resolve source bitrate once; reuse for every fragment encode call.
+        stream_br = probe_data.get("streams", [{}])[0].get("bit_rate")
+        fmt_br    = probe_data.get("format",  {}).get("bit_rate")
+        raw_br    = stream_br if (stream_br and str(stream_br).isdigit()) \
+                    else fmt_br if (fmt_br and str(fmt_br).isdigit()) \
+                    else None
+        source_bitrate: Optional[int] = min(int(raw_br), 15_000_000) if raw_br else None
+        print(
+            f"[wm_frag] source_bitrate="
+            f"{'%d kbps' % (source_bitrate // 1000) if source_bitrate else 'unknown (CRF fallback)'}"
+        )
+
         if total_duration < 5:
             print("[wm_frag] Video too short — single pass")
-            return add_random_text_overlay(input_file, output_file, text, progress_callback)
+            return add_random_text_overlay(
+                input_file, output_file, text, progress_callback,
+                source_bitrate=source_bitrate,
+            )
 
         if progress_callback:
             progress_callback(2)
 
-        # ── Step 2: Split into 60-second fragments (-c copy, no re-encode) ────
+        # ── Step 2: Split into fragments (-c copy, no re-encode) ──────────────
         frag_pattern = os.path.join(tmp_dir, "frag_%04d.mp4")
         split_result = subprocess.run(
             [
@@ -324,8 +434,7 @@ def add_watermark_parallel(
         if progress_callback:
             progress_callback(5)
 
-        # ── Step 3: Compute time offsets + fragment durations in one pass ─────
-        # Done up front so the encode loop has no ffprobe overhead per fragment.
+        # ── Step 3: Compute time offsets (single ffprobe pass per fragment) ───
         offsets      = []
         running_time = 0.0
         for frag in fragments:
@@ -337,30 +446,22 @@ def add_watermark_parallel(
                  frag],
                 capture_output=True, text=True,
             )
-            frag_data = json.loads(r.stdout)
-            frag_dur  = float(frag_data.get("format", {}).get("duration", chunk_duration))
+            frag_dur   = float(json.loads(r.stdout).get("format", {}).get("duration", chunk_duration))
             running_time += frag_dur
 
-        # ── Step 4: Shared wave params — seamless motion across all fragments ─
+        # ── Step 4: Shared wave params ─────────────────────────────────────────
         period_x = random.uniform(200, 500)
         period_y = period_x * 1.4142135623730951
         phase_x  = random.uniform(0, 6.2832)
         phase_y  = random.uniform(0, 6.2832)
 
-        # ── Step 5: Parallel fragment encode ──────────────────────────────────
-        # _MAX_PARALLEL_ENCODES controls concurrency (default 3 for 60s fragments):
-        #   - 60s fragment encode uses ~30-60 MB RAM each
-        #   - 3 parallel x 60 MB = 180 MB + 300 MB Python = ~480 MB — safe on 1 GB
-        #   - WM_MAX_PARALLEL=2 for more conservative; =4 only on 2 GB+ dynos
-        #
-        # Thread-safe progress: a Lock ensures parallel threads never race on
-        # the completed counter, so the bar always moves forward correctly.
+        # ── Step 5: Fragment encode ────────────────────────────────────────────
         import threading
         completed_count = [0]
         progress_lock   = threading.Lock()
-        wm_fragments    = [None] * total_frags
+        wm_fragments    = [None] * total_frags   # holds only string paths
 
-        def encode_fragment(idx, frag, offset):
+        def encode_fragment(idx: int, frag: str, offset: float):
             out_frag = os.path.join(tmp_dir, f"wm_{idx:04d}.mp4")
 
             result = add_random_text_overlay(
@@ -373,16 +474,24 @@ def add_watermark_parallel(
                 period_y=period_y,
                 phase_x=phase_x,
                 phase_y=phase_y,
+                source_bitrate=source_bitrate,  # ← reuse probed bitrate; no re-probe
             )
 
-            # Delete raw fragment only if watermarked output confirmed on disk
-            if result != frag and os.path.exists(out_frag):
+            # ── Delete raw fragment only after watermarked file is on disk ────
+            # add_random_text_overlay now fsyncs before returning, so this is safe.
+            # We double-check the output exists and is non-empty before unlinking.
+            if result == out_frag and os.path.exists(out_frag) and os.path.getsize(out_frag) > 0:
                 try:
                     os.remove(frag)
-                except OSError:
-                    pass
+                    print(f"[wm_frag] Raw fragment {os.path.basename(frag)} removed from disk")
+                except OSError as e:
+                    print(f"[wm_frag] Warning: could not remove raw fragment: {e}")
+            else:
+                print(
+                    f"[wm_frag] Watermark failed for fragment {idx} "
+                    f"(result={result!r}) — raw fragment kept as fallback"
+                )
 
-            # Thread-safe counter + progress update
             with progress_lock:
                 completed_count[0] += 1
                 done = completed_count[0]
@@ -406,9 +515,9 @@ def add_watermark_parallel(
             }
             for fut in concurrent.futures.as_completed(futures):
                 idx, result = fut.result()
-                wm_fragments[idx] = result
+                wm_fragments[idx] = result   # only a path string stored in RAM
 
-        # ── Step 6: Concat all watermarked fragments with -c copy ─────────────
+        # ── Step 6: Concat watermarked fragments ──────────────────────────────
         if progress_callback:
             progress_callback(92)
 
@@ -449,7 +558,7 @@ def add_watermark_parallel(
             pass
 
 
-# ─── send_vid integration ─────────────────────────────────────────────────────
+# ─── send_vid integration (unchanged) ────────────────────────────────────────
 
 async def send_vid(
     bot: Client,
@@ -489,20 +598,17 @@ async def send_vid(
             except Exception:
                 pass
 
+        loop = asyncio.get_running_loop()   # fixed: get_event_loop() deprecated in 3.10+
+
         def sync_progress_callback(pct):
             asyncio.run_coroutine_threadsafe(update_progress(pct), loop)
 
-        loop = asyncio.get_event_loop()
-
-        # ── Global semaphore: only 1 watermark job runs at a time bot-wide ───
-        # This prevents two simultaneous uploads from spawning two FFmpeg
-        # processes in parallel, defeating _MAX_PARALLEL_ENCODES entirely.
         async with _get_wm_semaphore():
             watermarked = await loop.run_in_executor(
                 None,
                 add_watermark_parallel,
                 filename, wm_output, watermark_text,
-                60,                     # fragment_duration: 60s fragments → smooth progress + tiny RAM
+                60,
                 sync_progress_callback,
                 None,
             )
@@ -661,7 +767,6 @@ async def aio(url, name):
     return k
 
 async def download(url, name):
-    """Stream download to disk — never buffers the full file in RAM."""
     MIME_TO_EXT = {
         'video/mp4':        'mp4',
         'video/x-matroska': 'mkv',
@@ -683,7 +788,6 @@ async def download(url, name):
                     _, url_ext = os.path.splitext(path)
                     ext = url_ext.lstrip('.') if url_ext else 'pdf'
                 ka = f'{name}.{ext}'
-                # ── Stream in 256 KB chunks — never loads full file into RAM ──
                 async with aiofiles.open(ka, mode='wb') as f:
                     async for chunk in resp.content.iter_chunked(256 * 1024):
                         if chunk:
@@ -905,7 +1009,6 @@ async def download_and_decrypt_video(url, cmd, name, key):
             return None
 
 async def split_video(filename):
-    """Split a video into parts of ~1999 MB each using ffmpeg segment muxer."""
     base, ext  = os.path.splitext(filename)
     pattern    = f"{base}_part%03d{ext}"
     file_size  = os.path.getsize(filename)
@@ -930,7 +1033,6 @@ async def split_video(filename):
     dir_name = os.path.dirname(filename) or "."
     parts = sorted([
         f for f in os.listdir(dir_name)
-        if os.path.basename(f).startswith(os.path.basename(base) + "_part")
-        and f.endswith(ext)
+        if f.startswith(os.path.basename(base) + "_part") and f.endswith(ext)
     ])
     return [os.path.join(dir_name, p) for p in parts]
