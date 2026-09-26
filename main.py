@@ -339,7 +339,7 @@ async def youtube_to_txt(client, message: Message):
         'extract_flat': True,
         'skip_download': True,
         'cookiefile': 'youtube_cookies.txt',
-        'extractor_args': {'youtube': {'player_client': ['tv', 'web']}}
+        'extractor_args': {'youtube': {'player_client': ['tv']}}
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
@@ -443,7 +443,7 @@ async def ytm_handler(bot: Client, m: Message):
                 cmd = (
                     f'yt-dlp -x --audio-format mp3 '
                     f'--cookies {cookies_file_path} '
-                    f'--extractor-args "youtube:player_client=tv,web" '
+                    f'--extractor-args "youtube:player_client=tv" '
                     f'-f "bestaudio[ext=m4a]/bestaudio" '
                     f'-R 25 --fragment-retries 25 '
                     f'"{url}" -o "{name}.mp3"'
@@ -975,7 +975,7 @@ async def txt_handler(bot: Client, m: Message):
             url = "https://" + Vxy
             link0 = "https://" + Vxy
 
-            name1 = links[i][0].replace("(", "[").replace(")", "]").replace("_", "").replace("\t", "").replace(":", "").replace("/", "").replace("+", "").replace("#", "").replace("|", "").replace("@", "").replace("*", "").replace(".", "").replace("https", "").replace("http", "").strip()
+            name1 = re.sub(r'[\\/:*?"<>|#@+\t]', '', links[i][0]).replace("(", "[").replace(")", "]").replace("_", "").replace("https", "").replace("http", "").strip()
             if "," in raw_text3:
                 name = f'{PRENAME} {name1[:60]}'
             else:
@@ -1036,7 +1036,7 @@ async def txt_handler(bot: Client, m: Message):
             elif "webvideos.classplusapp." in url:
                 cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
             elif "youtube.com" in url or "youtu.be" in url:
-                cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=tv,web" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
+                cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=tv" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
             elif ".m3u8" in url or "vimeo" in url or "akamaized" in url or "fastly" in url:
                 cmd = (f'yt-dlp -f "{ytf}" --concurrent-fragments 16 --no-part "{url}" -o "{name}.mp4"')
             else:
@@ -1324,7 +1324,7 @@ async def text_handler(bot: Client, m: Message):
             name = f'{audio_title[:60]}'
             name1 = f'{audio_title}'
         else:
-            name1 = links.replace("(", "[").replace(")", "]").replace("_", " ").replace("\t", "").replace(":", " ").replace("/", " ").replace("+", " ").replace("#", " ").replace("|", " ").replace("@", " ").replace("*", " ").replace(".", " ").replace("https", "").replace("http", "").strip()
+            name1 = re.sub(r'[\\/:*?"<>|#@+\t]', ' ', links).replace("(", "[").replace(")", "]").replace("_", " ").replace("https", "").replace("http", "").strip()
             name = f'{name1[:60]}'
 
         if "visionias" in url:
@@ -1383,7 +1383,7 @@ async def text_handler(bot: Client, m: Message):
         elif "webvideos.classplusapp." in url:
             cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
         elif "youtube.com" in url or "youtu.be" in url:
-            cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=tv,web" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
+            cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=tv" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
         elif ".m3u8" in url or "vimeo" in url or "akamaized" in url or "fastly" in url:
             cmd = (f'yt-dlp -f "{ytf}" --concurrent-fragments 16 --no-part "{url}" -o "{name}.mp4"')
         else:
