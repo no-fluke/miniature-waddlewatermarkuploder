@@ -273,6 +273,16 @@ async def cookies_handler(client: Client, m: Message):
         downloaded_path = await input_message.download()
         with open(downloaded_path, "r") as uploaded_file:
             cookies_content = uploaded_file.read()
+        if "# Netscape HTTP Cookie File" not in cookies_content and ".youtube.com" not in cookies_content:
+            await editable.delete()
+            await m.reply_text(
+                "⚠️ **Invalid cookie format!**\n\n"
+                "Please export cookies in **Netscape format** using a browser extension like:\n"
+                "• `Get cookies.txt LOCALLY` (Chrome)\n"
+                "• `cookies.txt` (Firefox)\n\n"
+                "The file must contain `.youtube.com` entries."
+            )
+            return
         db.delete_cookies()
         saved = db.save_cookies(cookies_content)
         with open(cookies_file_path, "w") as target_file:
@@ -328,10 +338,8 @@ async def youtube_to_txt(client, message: Message):
         'quiet': True,
         'extract_flat': True,
         'skip_download': True,
-        'force_generic_extractor': True,
-        'forcejson': True,
-        'cookies': 'youtube_cookies.txt',
-        'extractor_args': {'youtube': {'player_client': ['android']}}
+        'cookiefile': 'youtube_cookies.txt',
+        'extractor_args': {'youtube': {'player_client': ['tv', 'web']}}
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
@@ -435,7 +443,7 @@ async def ytm_handler(bot: Client, m: Message):
                 cmd = (
                     f'yt-dlp -x --audio-format mp3 '
                     f'--cookies {cookies_file_path} '
-                    f'--extractor-args "youtube:player_client=android" '
+                    f'--extractor-args "youtube:player_client=tv,web" '
                     f'-f "bestaudio[ext=m4a]/bestaudio" '
                     f'-R 25 --fragment-retries 25 '
                     f'"{url}" -o "{name}.mp3"'
@@ -1028,7 +1036,7 @@ async def txt_handler(bot: Client, m: Message):
             elif "webvideos.classplusapp." in url:
                 cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
             elif "youtube.com" in url or "youtu.be" in url:
-                cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=android" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
+                cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=tv,web" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
             elif ".m3u8" in url or "vimeo" in url or "akamaized" in url or "fastly" in url:
                 cmd = (f'yt-dlp -f "{ytf}" --concurrent-fragments 16 --no-part "{url}" -o "{name}.mp4"')
             else:
@@ -1375,7 +1383,7 @@ async def text_handler(bot: Client, m: Message):
         elif "webvideos.classplusapp." in url:
             cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
         elif "youtube.com" in url or "youtu.be" in url:
-            cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=android" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
+            cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=tv,web" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
         elif ".m3u8" in url or "vimeo" in url or "akamaized" in url or "fastly" in url:
             cmd = (f'yt-dlp -f "{ytf}" --concurrent-fragments 16 --no-part "{url}" -o "{name}.mp4"')
         else:
