@@ -999,6 +999,8 @@ async def txt_handler(bot: Client, m: Message):
                 params = {"url": f"{url}"}
                 response = requests.get('https://api.classplusapp.com/cams/uploader/video/jw-signed-url', headers=headers, params=params)
                 url = response.json()['url']
+            elif 'akamai-cdn.classplusapp' in url:
+                pass  # URL is already a valid signed HLS link, use directly
 
             if "edge.api.brightcove.com" in url:
                 bcov = f'bcov_auth={cwtoken}'
@@ -1349,6 +1351,8 @@ async def text_handler(bot: Client, m: Message):
             params = {"url": f"{url}"}
             response = requests.get('https://api.classplusapp.com/cams/uploader/video/jw-signed-url', headers=headers, params=params)
             url = response.json()['url']
+        elif 'akamai-cdn.classplusapp' in url:
+            pass  # URL is already a valid signed HLS link, use directly
         elif "childId" in url and "parentId" in url:
             url = f"https://pwplayer-38c1ae95b681.herokuapp.com/pw?url={url}&token={raw_text4}"
         elif "d1d34p8vz63oiq" in url or "sec1.pw.live" in url:
