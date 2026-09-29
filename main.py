@@ -1335,6 +1335,8 @@ async def text_handler(bot: Client, m: Message):
             mpd, keys = helper.get_mps_and_keys(url)
             url = mpd
             keys_string = " ".join([f"--key {key}" for key in keys])
+        elif 'akamai-cdn.classplusapp' in url:
+            pass  # URL is already a valid signed HLS link, use directly
         elif "classplusapp" in url:
             signed_api = f"https://cpapi-rjbs.onrender.com/extract_keys?url={url}@bots_updatee&user_id={user_id}"
             response = requests.get(signed_api, timeout=20)
