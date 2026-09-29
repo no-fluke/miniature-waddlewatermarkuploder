@@ -1029,7 +1029,7 @@ async def txt_handler(bot: Client, m: Message):
                 cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
             elif "youtube.com" in url or "youtu.be" in url:
                 cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=android" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
-            elif ".m3u8" in url or "vimeo" in url or "akamaized" in url or "fastly" in url:
+            elif ".m3u8" in url or "vimeo" in url or "akamaized" in url or "fastly" in url or "akamai-cdn.classplusapp" in url:
                 cmd = (f'yt-dlp -f "{ytf}" --concurrent-fragments 16 --no-part "{url}" -o "{name}.mp4"')
             else:
                 cmd = f'yt-dlp -f "{ytf}" "{url}" -o "{name}.mp4"'
@@ -1376,7 +1376,7 @@ async def text_handler(bot: Client, m: Message):
             cmd = f'yt-dlp --add-header "referer:https://web.classplusapp.com/" --add-header "x-cdn-tag:empty" -f "{ytf}" "{url}" -o "{name}.mp4"'
         elif "youtube.com" in url or "youtu.be" in url:
             cmd = (f'yt-dlp --cookies {cookies_file_path} --extractor-args "youtube:player_client=android" -f "{ytf}" -R 25 --fragment-retries 25 "{url}" -o "{name}.mp4"')
-        elif ".m3u8" in url or "vimeo" in url or "akamaized" in url or "fastly" in url:
+        elif ".m3u8" in url or "vimeo" in url or "akamaized" in url or "fastly" in url or "akamai-cdn.classplusapp" in url:
             cmd = (f'yt-dlp -f "{ytf}" --concurrent-fragments 16 --no-part "{url}" -o "{name}.mp4"')
         else:
             cmd = f'yt-dlp -f "{ytf}" "{url}" -o "{name}.mp4"'
